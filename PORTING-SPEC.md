@@ -1,7 +1,7 @@
 # flux3-klein-swift — Porting spec: FLUX 3 Image Klein → Swift/MLX
 
-Status: **P0–P2 done 2026-10-17.** The engine-free pipeline is gated end to end against BFL's renders (README).
-P3 (quant, footprint) and P5 (engine package) come next (the spec was written the same day, four days after release). It is a
+Status: **P0–P3 done 2026-10-17.** The engine-free pipeline is gated end to end; quant tiers have passed the OCR gate,
+footprints are measured, and the weights are on mlx-community. P5 (engine package) comes next (the spec was written the same day, four days after release). It is a
 **restricted, named-only tier for the Pixel Agency Image Engine** (`pixel-agency-image-engine`, with its MES HTTP and MCP
 bindings), not a product
 asset, following the Qwen-Image-2.1 precedent (AB-D-0085, AB-D-0116). The licence posture is in §1.
@@ -219,6 +219,20 @@ it is ≈ 13 GB, before the upsampler.
   AB-T-0312 shows int8 can drop letters: gate text with OCR, never by eye.
 - Footprint MEASURED in-app: resident + activation, at 0, 1 and 4 references and at the 4 MP single-ref
   cap. Declare per tier.
+
+**P3 done (2026-10-17):**
+- **Tiers:**
+  - DiT int8 and int4 are made on load. The int4 keeps the attention projections at 8 bits: uniform int4 put the last
+    block's hidden state at cos 0.84–0.86.
+  - The encoder loads text-only (qwen3vl 0.6.0) and can be int8.
+- **OCR gate:** every lane is within the pre-registered tolerance (README).
+- **Footprints:** measured under the engine's 2 GB pool cap. bf16 1024² peaks at 31.8 GB; int8 + int8 with the encoder
+  dropped at 18.8 GB. The 4 MP single-reference case needs 64 GB.
+- **Mirror:** [mlx-community/flux-3-image-klein-bf16](https://huggingface.co/mlx-community/flux-3-image-klein-bf16).
+  Gated `auto` like upstream, byte-identical (22 files), card with the Attribution Notice.
+- **Not done:**
+  - Pre-quantized repos. The download-size optimization stays later, per the fleet convention.
+  - Tiled or bf16 VAE decode. About 11 GB of the 1024² peak is the fp32 decode, the lever for 16–24 GB Macs.
 
 **P4 — upsampler**
 - Convert the upsampler (Qwen3.5-9B VL) to MLX int4/int8 and run it through `MLXVLM`, using

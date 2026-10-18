@@ -3,9 +3,15 @@
 //   Flux3KleinGate --sched <goldensDir>
 //   Flux3KleinGate --prep <prepGoldensDir>
 //   Flux3KleinGate --e2e <snapshot> <oracleDir> <example.json>... [--mlx-noise]
+//   Flux3KleinGate --oneshot <snapshot> <oracleDir> --dit bf16|int8|int4 --te bf16|int8 --case t2i|ref1|ref4|ref4mp
+//                  [--steps 2] [--drop-te] [--hold 6]   (footprint ledger: load, one request, hold for `footprint`)
 //   Flux3KleinGate --vae <snapshot> <goldensDir> [--gpu]
 //   Flux3KleinGate --encoder <snapshot> <goldensDir> [--gpu] [--bf16]
-//   Flux3KleinGate --dit <snapshot> <goldensDir> [--case t2i|ref1|ref3] [--gpu]
+//   Flux3KleinGate --dit <snapshot> <goldensDir> [--case t2i|ref1|ref3] [--gpu] [--quant int8|int4]
+//   Flux3KleinGate --encode-cache <snapshot> <prompts.json> <condDir> --te bf16|int8
+//   Flux3KleinGate --render-cache <snapshot> <prompts.json> <condDir> <outDir> --dit bf16|int8|int4 [--seeds 7,1234]
+//                  [--size 1024]   (the OCR lanes: encode once per encoder tier, denoise per DiT tier; MLX noise per
+//                  seed, shared by every lane; existing renders are skipped)
 //   Flux3KleinGate --run <snapshot> <goldensDir> [--gpu]
 //
 // Parity runs fp32 on the CPU stream by default (the fleet's regime); `--gpu` runs the same fp32 math on the GPU.
@@ -164,8 +170,10 @@ func gatePrep(_ dir: URL) throws {
 
 func gateE2E(snapshot: URL, oracle: URL, examples: [URL]) async throws {
     let start = Date()
-    let pipe = try await Flux3KleinPipeline.load(snapshot: snapshot)
-    print(String(format: "pipeline loaded (bf16 DiT + TE, fp32 VAE) in %.1fs", Date().timeIntervalSince(start)))
+    let quant = arg("--quant").flatMap(Flux3Quant.init(rawValue:)) ?? .bf16
+    let pipe = try await Flux3KleinPipeline.load(snapshot: snapshot, quant: quant)
+    print(String(format: "pipeline loaded (%@ DiT, bf16 TE, fp32 VAE) in %.1fs, MLX active %.2f GB", quant.rawValue,
+                 Date().timeIntervalSince(start), Double(Memory.activeMemory) / 1e9))
     let outDir = URL(fileURLWithPath: "outputs/e2e")
     try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
     for example in examples {
@@ -181,17 +189,115 @@ func gateE2E(snapshot: URL, oracle: URL, examples: [URL]) async throws {
         let t0 = Date()
         let result = try pipe.generate(req, noise: noise)
         let secs = Date().timeIntervalSince(t0)
-        let tag = has("--mlx-noise") ? "mlxnoise" : "torchnoise"
+        let tag = (has("--mlx-noise") ? "mlxnoise" : "torchnoise") + (quant == .bf16 ? "" : "-\(quant.rawValue)")
         try result.image.write(to: outDir.appendingPathComponent("\(name)__\(tag).png"))
         let bfl = Flux3RGBImage(try Flux3PNG.read(url: example.deletingPathExtension().appendingPathExtension("png")))
-        let mps = oracle.appendingPathComponent("e2e/\(name)__a6.93.png")
+        let mps = quant == .bf16 ? oracle.appendingPathComponent("e2e/\(name)__a6.93.png")
+            : outDir.appendingPathComponent("\(name)__torchnoise.png")  // quant tiers: vs our bf16 render
         let vsOracle = FileManager.default.fileExists(atPath: mps.path)
             ? psnr(result.image, Flux3RGBImage(try Flux3PNG.read(url: mps))) : -1
         let timing = result.timings.sorted { $0.key < $1.key }.map { String(format: "%@ %.1fs", $0.key, $0.value) }
             .joined(separator: ", ")
-        print(String(format: "  %@ %@ %d×%d  %.1fs (%@)  PSNR vs BFL %.2f dB, vs oracle MPS %.2f dB", name, tag,
-                     result.width, result.height, secs, timing, psnr(result.image, bfl), vsOracle))
+        print(String(format: "  %@ %@ %d×%d  %.1fs (%@)  PSNR vs BFL %.2f dB, vs %@ %.2f dB", name, tag,
+                     result.width, result.height, secs, timing, psnr(result.image, bfl),
+                     quant == .bf16 ? "oracle MPS" : "Swift bf16", vsOracle))
     }
+}
+
+struct PromptItem: Decodable { let id: String; let prompt: String }
+
+func loadPrompts(_ url: URL) throws -> [PromptItem] {
+    try JSONDecoder().decode([PromptItem].self, from: Data(contentsOf: url))
+}
+
+func encodeCache(snapshot: URL, prompts: URL, condDir: URL, te: Flux3TextEncoderQuant) async throws {
+    let enc = try await Flux3TextEncoder.load(directory: snapshot.appendingPathComponent("text_encoder"), quant: te)
+    let dir = condDir.appendingPathComponent(te.rawValue)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    for item in try loadPrompts(prompts) {
+        let e = enc.encode(item.prompt)
+        try MLX.save(arrays: ["features": e.features, "ids": e.ids], url: dir.appendingPathComponent("\(item.id).safetensors"))
+        print("  encoded \(item.id): \(e.tokenIds.count) tokens → \(e.paddedLength)")
+    }
+}
+
+func renderCache(snapshot: URL, prompts: URL, condDir: URL, outDir: URL, dit: Flux3Quant) throws {
+    let start = Date()
+    let pipe = Flux3KleinPipeline(
+        transformer: try Flux3Weights.loadTransformer(snapshot: snapshot, quant: dit),
+        textEncoder: nil, vaeEncoder: try Flux2VAEWeights.loadEncoder(directory: snapshot.appendingPathComponent("vae")),
+        vae: try Flux2VAEWeights.loadVAE(directory: snapshot.appendingPathComponent("vae")), snapshot: snapshot)
+    print(String(format: "DiT %@ + VAE loaded in %.1fs, MLX active %.2f GB", dit.rawValue, Date().timeIntervalSince(start),
+                 Double(Memory.activeMemory) / 1e9))
+    let seeds = (arg("--seeds") ?? "7,1234").split(separator: ",").compactMap { UInt32($0) }
+    let size = Int(arg("--size") ?? "1024")!
+    let teTiers = try FileManager.default.contentsOfDirectory(atPath: condDir.path).filter { !$0.hasPrefix(".") }.sorted()
+    let items = try loadPrompts(prompts)
+    for te in teTiers {
+        let lane = outDir.appendingPathComponent("\(dit.rawValue)-\(te)")
+        try FileManager.default.createDirectory(at: lane, withIntermediateDirectories: true)
+        for item in items {
+            let cond = try MLX.loadArrays(url: condDir.appendingPathComponent("\(te)/\(item.id).safetensors"))
+            for seed in seeds {
+                let png = lane.appendingPathComponent("\(item.id)-s\(seed).png")
+                if FileManager.default.fileExists(atPath: png.path) { continue }
+                Memory.peakMemory = 0
+                let t0 = Date()
+                let r = try pipe.generate(conditioned: cond["features"]!, textIDs: cond["ids"]!, width: size, height: size,
+                                          seed: seed)
+                let tmp = lane.appendingPathComponent(".\(item.id)-s\(seed).png")
+                try r.image.write(to: tmp)
+                try FileManager.default.moveItem(at: tmp, to: png)  // atomic: a killed run leaves no partial PNG
+                print(String(format: "  %@ %@ s%u  %.1fs  MLX peak %.2f GB", lane.lastPathComponent, item.id, seed,
+                             Date().timeIntervalSince(t0), Double(Memory.peakMemory) / 1e9))
+            }
+        }
+    }
+}
+
+func oneshot(snapshot: URL, oracle: URL) async throws {
+    // The engine's default buffer-pool cap (MLXServeCore GPUCacheConfiguration .automatic: min(2 GB, 5 % of budget)).
+    // Without it, MLX's pool keeps every freed buffer (the bf16 copies dropped by quantize-on-load included) and
+    // phys_footprint over-reads. FLUX3_CACHE_LIMIT_GB overrides.
+    Memory.cacheLimit = Int((Double(ProcessInfo.processInfo.environment["FLUX3_CACHE_LIMIT_GB"] ?? "2") ?? 2) * 1_073_741_824)
+    let dit = Flux3Quant(rawValue: arg("--dit") ?? "bf16")!
+    let te = Flux3TextEncoderQuant(rawValue: arg("--te") ?? "bf16")!
+    let caseName = arg("--case") ?? "t2i"
+    let steps = Int(arg("--steps") ?? "2")!
+    let gb = { (b: Int) in Double(b) / 1e9 }
+    var t0 = Date()
+    let pipe = try await Flux3KleinPipeline.load(snapshot: snapshot, quant: dit, textEncoderQuant: te)
+    eval(pipe.transformer)
+    let loadSecs = Date().timeIntervalSince(t0)
+    let residentAll = Memory.activeMemory
+    let inputs = oracle.appendingPathComponent("ref/examples/inputs")
+    let img = { (n: Int) in try Flux3RGBImage.read(url: inputs.appendingPathComponent("\(n).png")) }
+    var refs: [Flux3RGBImage] = []
+    switch caseName {
+    case "ref1": refs = [try img(2)]
+    case "ref4": refs = [try img(2), try img(3), try img(1), try img(2)]
+    case "ref4mp": refs = [try img(2).resized(width: 2048, height: 2048)]
+    default: break
+    }
+    let prompt = "A ceramic mug on a wooden desk by a window, morning light, a small sign that reads OPEN LATE."
+    Memory.peakMemory = 0
+    t0 = Date()
+    let conditioning = pipe.textEncoder!.encode(prompt)
+    eval(conditioning.features)
+    let encodePeak = Memory.peakMemory
+    if has("--drop-te") { pipe.releaseTextEncoder(); Memory.clearCache() }
+    let residentDiT = Memory.activeMemory
+    Memory.peakMemory = 0
+    let req = Flux3KleinPipeline.Request(prompt: prompt, references: refs, width: refs.isEmpty ? 1024 : nil,
+                                         height: refs.isEmpty ? 1024 : nil, steps: steps, seed: 1)
+    let r = try pipe.generate(req, conditioning: conditioning)
+    let secs = Date().timeIntervalSince(t0)
+    print(String(format: "oneshot dit=%@ te=%@ case=%@ %dx%d steps=%d drop-te=%@ | load %.1fs | MLX resident (all) %.2f GB, "
+                 + "resident for denoise %.2f GB, encode peak %.2f GB, request peak %.2f GB | %.1fs (%@)",
+                 dit.rawValue, te.rawValue, caseName, r.width, r.height, steps, has("--drop-te") ? "yes" : "no", loadSecs,
+                 gb(residentAll), gb(residentDiT), gb(encodePeak), gb(Memory.peakMemory), secs,
+                 r.timings.sorted { $0.key < $1.key }.map { String(format: "%@ %.1fs", $0.key, $0.value) }.joined(separator: ", ")))
+    if let hold = arg("--hold").flatMap(Double.init) { try await Task.sleep(for: .seconds(hold)) }
 }
 
 func tokens(_ g: [String: MLXArray]) -> Flux3Tokens {
@@ -260,6 +366,17 @@ func gateRun(_ model: Flux3Transformer, goldens: URL) throws {
 do {
     if has("--sched") {
         try gateSched(positional(after: "--sched", 1)[0])
+    } else if has("--encode-cache") {
+        let p = positional(after: "--encode-cache", 3)
+        try await encodeCache(snapshot: p[0], prompts: p[1], condDir: p[2],
+                              te: Flux3TextEncoderQuant(rawValue: arg("--te") ?? "bf16")!)
+    } else if has("--render-cache") {
+        let p = positional(after: "--render-cache", 4)
+        try renderCache(snapshot: p[0], prompts: p[1], condDir: p[2], outDir: p[3],
+                        dit: Flux3Quant(rawValue: arg("--dit") ?? "bf16")!)
+    } else if has("--oneshot") {
+        let p = positional(after: "--oneshot", 2)
+        try await oneshot(snapshot: p[0], oracle: p[1])
     } else if has("--prep") {
         try gatePrep(positional(after: "--prep", 1)[0])
     } else if has("--e2e") {
@@ -281,8 +398,11 @@ do {
         let p = positional(after: flag, 2)
         if !has("--gpu") { Device.setDefault(device: Device(.cpu)) }
         let start = Date()
-        let model = try Flux3Weights.loadTransformer(snapshot: p[0], dtype: .float32)
-        print(String(format: "DiT loaded fp32 on %@ in %.1fs", "\(Device.defaultDevice())", Date().timeIntervalSince(start)))
+        let quant = arg("--quant").flatMap(Flux3Quant.init(rawValue:)) ?? .bf16
+        let model = try Flux3Weights.loadTransformer(snapshot: p[0], dtype: quant == .bf16 ? .float32 : .bfloat16,
+                                                     quant: quant)
+        print(String(format: "DiT loaded (%@) on %@ in %.1fs", quant == .bf16 ? "fp32" : "bf16 + \(quant.rawValue)",
+                     "\(Device.defaultDevice())", Date().timeIntervalSince(start)))
         if flag == "--dit" { try gateDiT(model, goldens: p[1], only: arg("--case")) } else { try gateRun(model, goldens: p[1]) }
     } else {
         print("usage: Flux3KleinGate --sched <goldens> | --dit <snapshot> <goldens> [--case n] [--gpu] | --run <snapshot> <goldens> [--gpu]")

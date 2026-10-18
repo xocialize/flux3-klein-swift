@@ -19,8 +19,8 @@ let package = Package(
         // 0.32.3 carries the NAX split-K GEMM fix (mlx#3810); the DiT's MLP down-projection has K = 9216.
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.32.3"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
-        // Qwen3-VL conditioner backbone; ≥ 0.5.1 for hiddenStates(inputIds:layers:mask:positionIds:).
-        .package(url: "https://github.com/xocialize/qwen3vl-mlx-swift", from: "0.5.1"),
+        // Qwen3-VL conditioner backbone; ≥ 0.6.0: hiddenStates taps (0.5.1) and the text-only load.
+        .package(url: "https://github.com/xocialize/qwen3vl-mlx-swift", from: "0.6.0"),
         // The FLUX.2 VAE (FLUX 3 ships identical weights, AB-R-0571); ≥ 0.5.0 for Flux2VAEEncoder.
         .package(url: "https://github.com/xocialize/flux2-vae-mlx-swift", from: "0.5.0"),
     ],

@@ -4,3 +4,4 @@
 DerivedData/
 goldens/
 outputs/
+.build-p3/

@@ -16,8 +16,16 @@
 
 import Foundation
 import MLX
+import MLXNN
 import Qwen3VL
 import Tokenizers
+
+/// Text-encoder weight tier.
+public enum Flux3TextEncoderQuant: String, Sendable, CaseIterable {
+    case bf16, int8
+
+    public var bits: Int? { self == .int8 ? 8 : nil }
+}
 
 public final class Flux3TextEncoder {
     public let model: Qwen3VL
@@ -41,9 +49,16 @@ public final class Flux3TextEncoder {
         self.padId = pad
     }
 
-    /// Load `text_encoder/` from a FLUX 3 klein snapshot (or a stock Qwen3-VL-4B-Instruct folder).
-    public static func load(directory: URL, dtype: DType = .bfloat16) async throws -> Flux3TextEncoder {
-        let model = try Qwen3VLLoader.load(directory: directory, dtype: dtype)
+    /// Load `text_encoder/` from a FLUX 3 klein snapshot (or a stock Qwen3-VL-4B-Instruct folder), language model
+    /// only: the conditioner never sees images, so the vision tower is not built or read. `quant: .int8` quantizes the
+    /// language model's Linears after load (affine, group 64); the embedding table stays at `dtype`.
+    public static func load(directory: URL, dtype: DType = .bfloat16, quant: Flux3TextEncoderQuant = .bf16,
+                            groupSize: Int = 64) async throws -> Flux3TextEncoder {
+        let model = try Qwen3VLLoader.load(directory: directory, dtype: dtype, includeVision: false)
+        if let bits = quant.bits {
+            quantize(model: model, filter: { _, module in module is Linear ? (groupSize, bits, .affine) : nil })
+            eval(model)
+        }
         let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
         return try Flux3TextEncoder(model: model, tokenizer: tokenizer)
     }

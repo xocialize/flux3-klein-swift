@@ -19,7 +19,7 @@ public final class Flux3KleinPipeline {
     public let vae: Flux2VAE
     public let snapshot: URL
 
-    public init(transformer: Flux3Transformer, textEncoder: Flux3TextEncoder, vaeEncoder: Flux2VAEEncoder,
+    public init(transformer: Flux3Transformer, textEncoder: Flux3TextEncoder?, vaeEncoder: Flux2VAEEncoder,
                 vae: Flux2VAE, snapshot: URL) {
         self.transformer = transformer
         self.textEncoder = textEncoder
@@ -29,10 +29,12 @@ public final class Flux3KleinPipeline {
     }
 
     /// Load from a snapshot holding `model.safetensors`, `text_encoder/` and `vae/`.
-    public static func load(snapshot: URL, dtype: DType = .bfloat16) async throws -> Flux3KleinPipeline {
-        let transformer = try Flux3Weights.loadTransformer(snapshot: snapshot, dtype: dtype)
+    /// `quant` picks the DiT tier (quantized on load), `textEncoderQuant` the conditioner's.
+    public static func load(snapshot: URL, dtype: DType = .bfloat16, quant: Flux3Quant = .bf16,
+                            textEncoderQuant: Flux3TextEncoderQuant = .bf16) async throws -> Flux3KleinPipeline {
+        let transformer = try Flux3Weights.loadTransformer(snapshot: snapshot, dtype: dtype, quant: quant)
         let textEncoder = try await Flux3TextEncoder.load(
-            directory: snapshot.appendingPathComponent("text_encoder"), dtype: dtype)
+            directory: snapshot.appendingPathComponent("text_encoder"), dtype: dtype, quant: textEncoderQuant)
         let vaeDir = snapshot.appendingPathComponent("vae")
         let vaeEncoder = try Flux2VAEWeights.loadEncoder(directory: vaeDir, dtype: .float32)
         let vae = try Flux2VAEWeights.loadVAE(directory: vaeDir, dtype: .float32)
@@ -88,12 +90,17 @@ public final class Flux3KleinPipeline {
     /// Drop the text encoder (~8.9 GB) after the last prompt has been encoded.
     public func releaseTextEncoder() { textEncoder = nil }
 
-    public func generate(_ request: Request, noise providedNoise: MLXArray? = nil,
+    /// `conditioning`: the prompt already encoded (`textEncoder.encode(request.prompt)`), e.g. so the encoder can be
+    /// released before denoising; nil encodes here.
+    public func generate(_ request: Request, conditioning: Flux3TextEncoder.Encoded? = nil,
+                         noise providedNoise: MLXArray? = nil,
                          progress: ((Int, Int) -> Void)? = nil) throws -> Result {
         guard request.references.count <= Flux3References.maxReferences else {
             throw Flux3KleinError.invalidInput("at most \(Flux3References.maxReferences) references")
         }
-        guard let textEncoder else { throw Flux3KleinError.invalidInput("the text encoder was released") }
+        guard conditioning != nil || textEncoder != nil else {
+            throw Flux3KleinError.invalidInput("the text encoder was released and no conditioning was given")
+        }
         var timings: [String: Double] = [:]
         var clock = Date()
         func lap(_ name: String) { timings[name] = Date().timeIntervalSince(clock); clock = Date() }
@@ -124,14 +131,43 @@ public final class Flux3KleinPipeline {
         lap("references")
 
         // Text.
-        let text = textEncoder.encode(request.prompt)
-        let features = text.features.asType(dtype)
-        eval(features)
+        let text = conditioning ?? textEncoder!.encode(request.prompt)
+        eval(text.features)
         lap("text")
+
+        var result = try denoiseAndDecode(
+            features: text.features, textIDs: text.ids, condTokens: condTokens, condIDs: condIDs, width: width,
+            height: height, steps: request.steps, alpha: request.alpha,
+            seed: request.seed ?? Self.defaultSeed(request.prompt), noise: providedNoise, crop: crop, progress: progress)
+        result.timings.merge(timings) { a, _ in a }
+        return result
+    }
+
+    /// Text-to-image from pre-computed conditioning (`Flux3TextEncoder.Encoded`'s features and ids), e.g. a prompt
+    /// encoded once and rendered on several DiT tiers.
+    public func generate(conditioned features: MLXArray, textIDs: MLXArray, width: Int = 1024, height: Int = 1024,
+                         steps: Int = Flux3Schedule.defaultSteps, alpha: Double = Flux3Schedule.defaultAlpha,
+                         seed: UInt32, noise: MLXArray? = nil) throws -> Result {
+        guard width % 16 == 0, height % 16 == 0 else {
+            throw Flux3KleinError.invalidInput("width and height must be multiples of 16 (got \(width)×\(height))")
+        }
+        return try denoiseAndDecode(features: features, textIDs: textIDs, condTokens: [], condIDs: [], width: width,
+                                    height: height, steps: steps, alpha: alpha, seed: seed, noise: noise, crop: nil,
+                                    progress: nil)
+    }
+
+    func denoiseAndDecode(features rawFeatures: MLXArray, textIDs: MLXArray, condTokens: [MLXArray],
+                          condIDs: [MLXArray], width: Int, height: Int, steps: Int, alpha: Double, seed: UInt32,
+                          noise providedNoise: MLXArray?, crop: Flux3References.Box?,
+                          progress: ((Int, Int) -> Void)?) throws -> Result {
+        var timings: [String: Double] = [:]
+        var clock = Date()
+        func lap(_ name: String) { timings[name] = Date().timeIntervalSince(clock); clock = Date() }
+        let dtype = transformer.dtype
+        let features = rawFeatures.asType(dtype)
 
         // Noise and tokens.
         let (lh, lw) = (height / 16, width / 16)
-        let seed = request.seed ?? Self.defaultSeed(request.prompt)
         var x = providedNoise?.asType(.float32) ?? Self.noise(seed: seed, latentHeight: lh, latentWidth: lw)
         guard x.shape == [lh * lw, 128] else {
             throw Flux3KleinError.invalidInput("noise shape \(x.shape) ≠ [\(lh * lw), 128]")
@@ -140,17 +176,17 @@ public final class Flux3KleinPipeline {
             image: x, imageIDs: Flux3Latents.ids(height: lh, width: lw),
             cond: condTokens.isEmpty ? nil : concatenated(condTokens, axis: 0),
             condIDs: condIDs.isEmpty ? nil : concatenated(condIDs, axis: 0),
-            text: features, textIDs: text.ids)
+            text: features, textIDs: textIDs)
         let rope = Flux3RopeSet(tokens, config: transformer.config)
 
         // Flow-map Euler.
-        let schedule = Flux3Schedule.timesteps(steps: request.steps, alpha: request.alpha)
-        for step in 0..<request.steps {
+        let schedule = Flux3Schedule.timesteps(steps: steps, alpha: alpha)
+        for step in 0..<steps {
             tokens.image = x
             let velocity = transformer(tokens, rope: rope, t: schedule[step], tNext: schedule[step + 1])
             x = Flux3Schedule.step(x, velocity: velocity, t: schedule[step], tNext: schedule[step + 1])
             eval(x)
-            progress?(step + 1, request.steps)
+            progress?(step + 1, steps)
         }
         lap("denoise")
 
