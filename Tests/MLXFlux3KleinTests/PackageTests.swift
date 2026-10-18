@@ -74,31 +74,68 @@ final class Flux3KleinPackageTests: XCTestCase {
     }
 
     func testWeightSourceIsThePinnedMirror() {
-        let s = Flux3KleinConfiguration().weightSources
+        let s = Flux3KleinConfiguration(upsampler: .off).weightSources
         XCTAssertEqual(s.map(\.repo), ["mlx-community/flux-3-image-klein-bf16"])
         XCTAssertEqual(s.first?.revision?.count, 40)  // a commit, never a moving "main"
         XCTAssertTrue(s.first?.matching?.contains("NOTICE.md") ?? false)  // §3: the notice travels with the weights
+    }
+
+    /// The upsampler is on by default (int8), from its own pinned mirror; `.off` drops the source.
+    func testUpsamplerSources() {
+        let s = Flux3KleinConfiguration().weightSources
+        XCTAssertEqual(s.map(\.role), ["snapshot", "upsampler"])
+        XCTAssertEqual(s.last?.repo, "mlx-community/flux-3-image-klein-pup-8bit")
+        for tier in Flux3UpsamplerTier.allCases where tier != .off {
+            XCTAssertEqual(tier.revision?.count, 40, "\(tier) is pinned to a commit")
+        }
+        XCTAssertNil(Flux3UpsamplerTier.off.repo)
+        // Only the bf16 upsampler's transient exceeds the declared activation.
+        XCTAssertNil(Flux3KleinConfiguration(upsampler: .int8).peakActivationBytesHint)
+        XCTAssertNil(Flux3KleinConfiguration(upsampler: .int4).peakActivationBytesHint)
+        XCTAssertGreaterThan(Flux3KleinConfiguration(upsampler: .bf16).peakActivationBytesHint!,
+                             Flux3KleinFootprints.declared.map(\.peakActivationBytes).max()!)
+    }
+
+    func testMetaDataLevers() throws {
+        XCTAssertNil(try Flux3KleinMetaKeys.upsample([:]))
+        XCTAssertEqual(try Flux3KleinMetaKeys.upsample(["upsample": .bool(false)]), false)
+        XCTAssertThrowsError(try Flux3KleinMetaKeys.upsample(["upsample": .string("no")]))
+        let boxes = try Flux3KleinMetaKeys.boxes(["boxes": .array([
+            .object(["id": .string("sun"), "bbox": .array([.double(0.1), .double(0.2), .int(0), .double(0.5)]),
+                     "desc": .string("a low sun")]),
+            .object(["from": .string("ref_image_0"), "src_bbox": .array([.double(0.5), .double(0.5), .double(0.9), .double(0.9)]),
+                     "tgt_bbox": .null]),
+        ])])
+        XCTAssertEqual(boxes?.count, 2)
+        XCTAssertEqual(boxes?.first?.id, "sun")
+        XCTAssertEqual(boxes?.last?.from, "ref_image_0")
+        XCTAssertNil(boxes?.last?.tgtBBox)
+        XCTAssertThrowsError(try Flux3KleinMetaKeys.boxes(["boxes": .string("x")]))
     }
 
     func testMATGate() {
         let haveLocal = FileManager.default.fileExists(atPath: Self.weights + "/model.safetensors")
         let report = MaterializationConformance.check(
             freshConfiguration: Flux3KleinConfiguration(),
-            satisfiedConfiguration: haveLocal ? Flux3KleinConfiguration(snapshotPath: Self.weights) : nil)
+            satisfiedConfiguration: haveLocal
+                ? Flux3KleinConfiguration(snapshotPath: Self.weights, upsamplerPath: Self.weights + "-pup") : nil)
         XCTAssertTrue(report.passed, report.summary)
     }
 
     func testConfigurationRoundTrips() throws {
-        let cfg = Flux3KleinConfiguration(quant: .int4, textEncoderQuant: .int8, snapshotPath: "/tmp/x", defaultSteps: 12)
+        let cfg = Flux3KleinConfiguration(quant: .int4, textEncoderQuant: .int8, snapshotPath: "/tmp/x", defaultSteps: 12,
+                                          upsampler: .int4)
         let back = try JSONDecoder().decode(Flux3KleinConfiguration.self, from: JSONEncoder().encode(cfg))
         XCTAssertEqual(back.quant, .int4)
         XCTAssertEqual(back.textEncoderQuant, .int8)
         XCTAssertEqual(back.snapshotPath, "/tmp/x")
         XCTAssertEqual(back.defaultSteps, 12)
         XCTAssertFalse(back.keepEncoderResident)
+        XCTAssertEqual(back.upsampler, .int4)
         let minimal = try JSONDecoder().decode(Flux3KleinConfiguration.self, from: Data(#"{"quant":"int8"}"#.utf8))
         XCTAssertEqual(minimal.textEncoderQuant, .bf16)
         XCTAssertEqual(minimal.defaultSteps, 16)
+        XCTAssertEqual(minimal.upsampler, .int8, "configurations saved before P4 get the default upsampler")
     }
 
     /// A per-request encoder stays under the declared activation (so no hint); a resident one moves into the

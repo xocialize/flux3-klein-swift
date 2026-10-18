@@ -1,6 +1,10 @@
 // Flux3KleinGate — parity gates against the oracle goldens (mlxengine-image/WIP/flux3-klein-oracle).
 //
 //   Flux3KleinGate --sched <goldensDir>
+//   Flux3KleinGate --pup <pupDir> <oracleDir> [--tokens-only] [--case name]   (the prompt upsampler: prompt-token parity
+//                  with the HF processor, then captions for the shipped records → outputs/pup/)
+//   Flux3KleinGate --pup-tier <pupDir> <oracleDir> <tag>   (captions for BFL's 19 unique example requests → outputs/pup/<tag>/)
+//   Flux3KleinGate --boxes <goldensDir>   (the bbox.py port: plan / detect / is_finished / reconcile / to_canvas)
 //   Flux3KleinGate --prep <prepGoldensDir>
 //   Flux3KleinGate --e2e <snapshot> <oracleDir> <example.json>... [--mlx-noise] [--untiled]
 //   Flux3KleinGate --oneshot <snapshot> <oracleDir> --dit bf16|int8|int4 --te bf16|int8 --case t2i|ref1|ref4|ref4mp
@@ -21,8 +25,10 @@
 // golden noise (text features from the dit_t2i golden — the same prompt and encoder), every step's latents.
 
 import Foundation
+import ImageIO
 import Flux2VAE
 import Flux3Klein
+import Flux3KleinUpsampler
 import MLX
 import MLXFlux3Klein
 import MLXToolKit
@@ -346,7 +352,9 @@ func oneshot(snapshot: URL, oracle: URL) async throws {
 func packageSmoke(snapshot: URL, oracle: URL) async throws {
     let quant = Quant(rawValue: arg("--quant") ?? "bf16") ?? .bf16
     let steps = Int(arg("--steps") ?? "16")!
-    let package = Flux3KleinPackage(configuration: Flux3KleinConfiguration(quant: quant, snapshotPath: snapshot.path))
+    let pup = arg("--pup-dir") ?? "/Volumes/Satechi/Development/mlxengine-image/weights/publish/flux-3-image-klein-pup-8bit"
+    let package = Flux3KleinPackage(configuration: Flux3KleinConfiguration(quant: quant, snapshotPath: snapshot.path,
+                                                                           upsamplerPath: pup))
     var t0 = Date()
     try await package.load()
     print(String(format: "package loaded (%@) in %.1fs, MLX active %.2f GB", quant.rawValue, Date().timeIntervalSince(t0),
@@ -356,7 +364,9 @@ func packageSmoke(snapshot: URL, oracle: URL) async throws {
     let caption = "A hand-painted wooden shop sign that reads \"OPEN LATE\" in cream serif letters on deep green, "
         + "hanging from a wrought-iron bracket on a brick wall, warm evening light from the left, shallow depth of field."
     t0 = Date()
-    let t2i = try await package.run(T2IRequest(prompt: caption, width: 1184, height: 896, steps: steps, seed: 7))
+    // A full caption, sent as typed (the upsampler is skipped).
+    let t2i = try await package.run(T2IRequest(prompt: caption, width: 1184, height: 896, steps: steps, seed: 7,
+                                               metaData: ["upsample": .bool(false)]))
     guard let image = (t2i as? T2IResponse)?.image else { failures += 1; print("FAIL t2i: no image"); return }
     try image.data.write(to: out.appendingPathComponent("t2i-\(quant.rawValue).png"))
     print(String(format: "  PASS t2i %dx%d in %.1fs", image.width ?? 0, image.height ?? 0, Date().timeIntervalSince(t0)))
@@ -369,6 +379,19 @@ func packageSmoke(snapshot: URL, oracle: URL) async throws {
     guard let edited = (edit as? IEditResponse)?.image else { failures += 1; print("FAIL edit: no image"); return }
     try edited.data.write(to: out.appendingPathComponent("edit-\(quant.rawValue).png"))
     print(String(format: "  PASS edit %dx%d in %.1fs", edited.width ?? 0, edited.height ?? 0, Date().timeIntervalSince(t0)))
+    // A short request, upsampled first (the default path).
+    Memory.cacheLimit = 2 * 1_073_741_824
+    let residentBefore = Memory.activeMemory
+    Memory.peakMemory = 0
+    t0 = Date()
+    let short = try await package.run(T2IRequest(prompt: "a hand-painted shop sign that says OPEN LATE", width: 1024,
+                                                 height: 1024, steps: steps, seed: 7))
+    guard let shortImage = (short as? T2IResponse)?.image else { failures += 1; print("FAIL short: no image"); return }
+    try shortImage.data.write(to: out.appendingPathComponent("t2i-upsampled-\(quant.rawValue).png"))
+    print(String(format: "  PASS upsampled t2i %dx%d in %.1fs; MLX resident %.2f GB, request peak %.2f GB (activation %.2f GB)",
+                 shortImage.width ?? 0, shortImage.height ?? 0, Date().timeIntervalSince(t0),
+                 Double(residentBefore) / 1e9, Double(Memory.peakMemory) / 1e9,
+                 Double(Memory.peakMemory - residentBefore) / 1e9))
     do {
         _ = try await package.run(T2IRequest(prompt: "x", width: 2064, height: 2048, steps: 1))
         failures += 1; print("  FAIL envelope: 2064×2048 was not refused")
@@ -376,6 +399,138 @@ func packageSmoke(snapshot: URL, oracle: URL) async throws {
         print("  PASS envelope refusal: \(error.localizedDescription)")
     }
     await package.unload()
+}
+
+func boxesFrom(_ any: Any?) -> [Flux3Box]? {
+    guard let list = any as? [[String: Any]] else { return nil }
+    func nums(_ v: Any?) -> [Double]? { (v as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue } }
+    return list.map { d in
+        Flux3Box(id: d["id"] as? String, desc: d["desc"] as? String, bbox: nums(d["bbox"]), from: d["from"] as? String,
+                 srcBBox: nums(d["src_bbox"]), tgtBBox: nums(d["tgt_bbox"]))
+    }
+}
+
+func gateBoxes(_ goldens: URL) throws {
+    let cases = try JSONSerialization.jsonObject(with: Data(contentsOf: goldens.appendingPathComponent("boxes.json"))) as! [[String: Any]]
+    for (n, c) in cases.enumerated() {
+        let kind = c["kind"] as! String
+        var ok = false, note = ""
+        switch kind {
+        case "plan":
+            let (key, text, locked) = try Flux3Boxes.plan(c["prompt"] as! String, boxes: boxesFrom(c["boxes"]),
+                                                          imageCount: c["images"] as! Int)
+            let lockedS = locked.map { Flux3JSON.array($0).dumps() } ?? "null"
+            ok = key == c["key"] as! String && text == c["text"] as! String && lockedS == c["locked_s"] as! String
+            note = "key \(key)"
+        case "detect":
+            let found = Flux3Boxes.detect(c["prompt"] as! String)
+            let caption = found?.0, rowsS = found.map { Flux3JSON.array($0.1).dumps() }
+            ok = caption == c["caption"] as? String && rowsS == c["rows_s"] as? String
+                && Flux3Boxes.isFinished(c["prompt"] as! String) == c["finished"] as! Bool
+            note = "found \(found != nil), finished \(Flux3Boxes.isFinished(c["prompt"] as! String))"
+        case "reconcile":
+            guard case .array(let locked)? = Flux3JSON.parse(c["locked_s"] as! String) else { fatalError("bad locked") }
+            let out = Flux3Boxes.reconcile(c["text"] as! String, locked: locked)
+            ok = out == c["out"] as! String
+            if !ok { note = "\n      ours: \(out)\n      want: \(c["out"] as! String)" }
+        case "canvas":
+            let rows = try Flux3Boxes.toCanvas(boxesFrom(c["boxes"])!)
+            let s = Flux3JSON.array(rows).dumps()
+            ok = s == c["rows_s"] as! String
+            if !ok { note = "\n      ours: \(s)\n      want: \(c["rows_s"] as! String)" }
+        default: continue
+        }
+        if !ok { failures += 1 }
+        print("  \(ok ? "PASS" : "FAIL") box case \(n) \(kind) \(note)")
+    }
+}
+
+func gatePup(pup: URL, oracle: URL) async throws {
+    let t0 = Date()
+    let up = try await Flux3PromptUpsampler.load(directory: pup)
+    print(String(format: "upsampler loaded in %.1fs, MLX active %.2f GB", Date().timeIntervalSince(t0),
+                 Double(Memory.activeMemory) / 1e9))
+    let goldens = oracle.appendingPathComponent("goldens/pup")
+    let cases = try JSONSerialization.jsonObject(with: Data(contentsOf: goldens.appendingPathComponent("prompts.json"))) as! [String: [String: Any]]
+    let out = URL(fileURLWithPath: "outputs/pup")
+    try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    for name in cases.keys.sorted() where arg("--case") == nil || arg("--case") == name {
+        let c = cases[name]!
+        let key = c["key"] as! String, nRefs = c["n_refs"] as! Int
+        // The golden policy_reference pixels, so the token check isolates the template + processor.
+        let refs: [CGImage] = try (0..<nRefs).map { i in
+            let url = goldens.appendingPathComponent("\(name).ref\(i).png")
+            guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { throw Flux3KleinError.loading("no \(url.path)") }
+            return cg
+        }
+        let userText = c["user_text"] as! String
+        let user = nRefs == 0 ? userText
+            : (key.hasSuffix("bbox")
+                ? "Reference images follow in attachment order: ref_image_0, ref_image_1, ...\nUser editing instruction: \(userText)\nDecide the edit, imagine the target image, and output the annotation record."
+                : "Reference images follow in order (the first image, the second image, ...).\nUser request: \(userText)\nOutput the caption.")
+        let ours = try await up.promptTokens(system: up.systemPrompts[key]!, user: user, images: refs)
+        let golden = (c["input_ids"] as! [Int])
+        let firstDiff = zip(ours, golden).enumerated().first { $0.element.0 != $0.element.1 }?.offset
+        let same = ours == golden
+        if !same { failures += 1 }
+        print("  \(same ? "PASS" : "FAIL") \(name) prompt tokens: ours \(ours.count) / HF \(golden.count)"
+              + (same ? "" : ", first difference at \(firstDiff ?? min(ours.count, golden.count))"))
+        if has("--tokens-only") { continue }
+        // The caption, through the public entry point (box planning, the scaffold, reconcile), from the record's inputs.
+        let record = try loadJSON(oracle.appendingPathComponent("ref/examples/\(c["record"] as! String)"))
+        let inputs = try ((record["references"] as? [String]) ?? []).map {
+            try Flux3PNG.read(url: oracle.appendingPathComponent("ref").appendingPathComponent($0))
+        }
+        let boxes = boxesFrom(record["boxes"])
+        let t1 = Date()
+        let caption = has("--golden-refs")
+            ? try await up.upsample(record["input_prompt"] as! String, preparedReferences: refs, boxes: boxes)
+            : try await up.upsample(record["input_prompt"] as! String, references: inputs, boxes: boxes)
+        let secs = Date().timeIntervalSince(t1)
+        try caption.write(to: out.appendingPathComponent("\(name)\(has("--golden-refs") ? ".goldenrefs" : "").txt"),
+                          atomically: true, encoding: .utf8)
+        let bfl = c["bfl_caption"] as! String
+        print(String(format: "    caption %d chars in %.1fs (BFL %d chars), exact match %@", caption.count, secs, bfl.count,
+                     caption == bfl ? "YES" : "no"))
+    }
+}
+
+let pupTierRecords = [
+    "distilled/man_dog", "distilled/balloons", "distilled/2_coffee", "distilled/2_3_mugprint", "distilled/1_figurine",
+    "distilled/3_bandana", "distilled/cactus", "base_vs_distilled/church_distilled", "base_vs_distilled/fashion_seamless_distilled",
+    "base_vs_distilled/hiroshige_distilled", "base_vs_distilled/riso_lido_distilled", "base_vs_distilled/still_life_distilled",
+    "inputs/2", "inputs/3", "typography/cereal_box", "typography/field_notes", "typography/gig_poster", "typography/tea_tin",
+    "upsampling/double_exposure_s1",
+]
+
+func gatePupTier(pup: URL, oracle: URL, tag: String) async throws {
+    Memory.cacheLimit = 2 * 1_073_741_824
+    let t0 = Date()
+    let up = try await Flux3PromptUpsampler.load(directory: pup)
+    print(String(format: "upsampler %@ loaded in %.1fs, MLX active %.2f GB", tag, Date().timeIntervalSince(t0),
+                 Double(Memory.activeMemory) / 1e9))
+    let out = URL(fileURLWithPath: "outputs/pup/\(tag)")
+    try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    var timings: [String: Double] = [:]
+    Memory.peakMemory = 0
+    for rel in pupTierRecords {
+        let name = rel.replacingOccurrences(of: "/", with: "__")
+        let file = out.appendingPathComponent("\(name).txt")
+        if FileManager.default.fileExists(atPath: file.path) { continue }
+        let record = try loadJSON(oracle.appendingPathComponent("ref/examples/\(rel).json"))
+        let inputs = try ((record["references"] as? [String]) ?? []).map {
+            try Flux3PNG.read(url: oracle.appendingPathComponent("ref").appendingPathComponent($0))
+        }
+        let t1 = Date()
+        let caption = try await up.upsample(record["input_prompt"] as! String, references: inputs, boxes: boxesFrom(record["boxes"]))
+        timings[name] = Date().timeIntervalSince(t1)
+        try caption.write(to: file, atomically: true, encoding: .utf8)
+        print(String(format: "  %@ %@: %d chars in %.1fs", tag, name, caption.count, timings[name]!))
+    }
+    print(String(format: "%@ MLX peak %.2f GB", tag, Double(Memory.peakMemory) / 1e9))
+    let data = try JSONSerialization.data(withJSONObject: ["timings": timings, "peak_gb": Double(Memory.peakMemory) / 1e9])
+    try data.write(to: out.appendingPathComponent("run.json"))
 }
 
 func tokens(_ g: [String: MLXArray]) -> Flux3Tokens {
@@ -452,6 +607,14 @@ do {
         let p = positional(after: "--render-cache", 4)
         try renderCache(snapshot: p[0], prompts: p[1], condDir: p[2], outDir: p[3],
                         dit: Flux3Quant(rawValue: arg("--dit") ?? "bf16")!)
+    } else if has("--pup") {
+        let p = positional(after: "--pup", 2)
+        try await gatePup(pup: p[0], oracle: p[1])
+    } else if has("--pup-tier") {
+        let p = positional(after: "--pup-tier", 3)
+        try await gatePupTier(pup: p[0], oracle: p[1], tag: p[2].lastPathComponent)
+    } else if has("--boxes") {
+        try gateBoxes(positional(after: "--boxes", 1)[0])
     } else if has("--package") {
         let p = positional(after: "--package", 2)
         try await packageSmoke(snapshot: p[0], oracle: p[1])

@@ -9,6 +9,33 @@ import Flux3Klein
 import Foundation
 import MLXToolKit
 
+/// The prompt upsampler's tier (black-forest-labs/flux-3-image-klein-pup, Apache-2.0; mlx-community mirrors, pinned).
+/// Every tier keeps quoted text verbatim and box tables complete on BFL's 19 example requests (AB-R receipt, P4); lower
+/// tiers paraphrase more. `.off` sends the prompt as typed.
+public enum Flux3UpsamplerTier: String, Codable, Sendable, CaseIterable {
+    case off, bf16, int8, int4
+
+    public var repo: String? {
+        switch self {
+        case .off: nil
+        case .bf16: "mlx-community/flux-3-image-klein-pup-bf16"
+        case .int8: "mlx-community/flux-3-image-klein-pup-8bit"
+        case .int4: "mlx-community/flux-3-image-klein-pup-4bit"
+        }
+    }
+
+    /// Mirror commits, pinned (bf16 byte-identical to upstream 3f3edb52; 8/4-bit mlx-vlm 0.7.8 conversions with the
+    /// upstream tokenizer, template, processor configs and system prompts).
+    public var revision: String? {
+        switch self {
+        case .off: nil
+        case .bf16: "cf0e42c70a05ad6f6fdef75e46267299ff12554e"
+        case .int8: "3391b4504c1327229665a2e7a6b1ecd71e673c30"
+        case .int4: "34abfa0769000d6a542169b0e61a04059697467c"
+        }
+    }
+}
+
 public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, QuantConfigured, FootprintConfigured,
     WeightSourcing {
     /// DiT tier: `.bf16`, `.int8`, or `.int4` (attention projections at 8 bits). All are made at load, and all are
@@ -22,6 +49,12 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
     /// Keep the conditioner (8.0 GB bf16, 4.6 GB int8) resident between requests. Off: it loads per request and is
     /// released before denoising, which is what the declared footprint measures.
     public var keepEncoderResident: Bool
+    /// The prompt upsampler, loaded per request and released before the encoder. FLUX 3 Klein wants full scene
+    /// captions, so it is on by default (int8: 11.1 GB transient, under the declared activation). A request skips it
+    /// with `metaData["upsample"] = false`, or by sending a finished caption with a cited box table.
+    public var upsampler: Flux3UpsamplerTier
+    /// Explicit upsampler snapshot (`system_prompts.json`, `config.json`, weights). Empty = the store.
+    public var upsamplerPath: String
     public var modelsRootDirectory: URL?
 
     public static let repo = "mlx-community/flux-3-image-klein-bf16"
@@ -33,17 +66,19 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
 
     public init(quant: Quant = .bf16, textEncoderQuant: Flux3TextEncoderQuant = .bf16, snapshotPath: String = "",
                 defaultSteps: Int = Flux3Schedule.defaultSteps, keepEncoderResident: Bool = false,
-                modelsRootDirectory: URL? = nil) {
+                upsampler: Flux3UpsamplerTier = .int8, upsamplerPath: String = "", modelsRootDirectory: URL? = nil) {
         self.quant = quant
         self.textEncoderQuant = textEncoderQuant
         self.snapshotPath = snapshotPath
         self.defaultSteps = defaultSteps
         self.keepEncoderResident = keepEncoderResident
+        self.upsampler = upsampler
+        self.upsamplerPath = upsamplerPath
         self.modelsRootDirectory = modelsRootDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
-        case quant, textEncoderQuant, snapshotPath, defaultSteps, keepEncoderResident
+        case quant, textEncoderQuant, snapshotPath, defaultSteps, keepEncoderResident, upsampler, upsamplerPath
     }
 
     public init(from decoder: Decoder) throws {
@@ -53,6 +88,8 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
         snapshotPath = try c.decodeIfPresent(String.self, forKey: .snapshotPath) ?? ""
         defaultSteps = try c.decodeIfPresent(Int.self, forKey: .defaultSteps) ?? Flux3Schedule.defaultSteps
         keepEncoderResident = try c.decodeIfPresent(Bool.self, forKey: .keepEncoderResident) ?? false
+        upsampler = try c.decodeIfPresent(Flux3UpsamplerTier.self, forKey: .upsampler) ?? .int8
+        upsamplerPath = try c.decodeIfPresent(String.self, forKey: .upsamplerPath) ?? ""
         modelsRootDirectory = nil
     }
 
@@ -65,12 +102,38 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
         return dit + Flux3KleinFootprints.encoderBytes(textEncoderQuant)
     }
 
-    public var peakActivationBytesHint: UInt64? { nil }
+    /// Only the bf16 upsampler's transient (20.2 GB peak) exceeds the declared activation; int8 / int4 stay under it.
+    public var peakActivationBytesHint: UInt64? {
+        upsampler == .bf16 ? Flux3KleinFootprints.bf16UpsamplerPeakActivationBytes : nil
+    }
 
     public var weightSources: [WeightSource] {
-        [WeightSource(role: "snapshot", repo: Self.repo, revision: Self.revision,
-                      matching: ["model.safetensors", "config.json", "manifest.json", "text_encoder/*", "vae/*",
-                                 "LICENSE.md", "NOTICE.md"])]
+        var sources = [WeightSource(role: "snapshot", repo: Self.repo, revision: Self.revision,
+                                    matching: ["model.safetensors", "config.json", "manifest.json", "text_encoder/*",
+                                               "vae/*", "LICENSE.md", "NOTICE.md"])]
+        if let repo = upsampler.repo {
+            sources.append(WeightSource(role: "upsampler", repo: repo, revision: upsampler.revision))
+        }
+        return sources
+    }
+
+    static func upsamplerComplete(_ dir: URL) -> Bool {
+        let fm = FileManager.default
+        return ["system_prompts.json", "config.json", "tokenizer.json"].allSatisfy {
+            fm.fileExists(atPath: dir.appendingPathComponent($0).path)
+        }
+    }
+
+    /// The upsampler root: the explicit path, else the store's flat or revision directory; nil when `.off`.
+    public func resolvedUpsamplerDirectory(storeRoot: URL?) -> URL? {
+        guard let repo = upsampler.repo else { return nil }
+        if !upsamplerPath.isEmpty { return URL(fileURLWithPath: upsamplerPath) }
+        let store = ModelStore(root: storeRoot)
+        if let flat = store.directory(for: repo), Self.upsamplerComplete(flat) { return flat }
+        if let snap = store.snapshotDirectory(for: repo, revision: upsampler.revision), Self.upsamplerComplete(snap) {
+            return snap
+        }
+        return store.directory(for: repo)
     }
 
     static func complete(_ dir: URL) -> Bool {
@@ -81,9 +144,15 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
     }
 
     public func missingWeightSources(storeRoot: URL?) -> [WeightSource] {
-        if !snapshotPath.isEmpty, Self.complete(URL(fileURLWithPath: snapshotPath)) { return [] }
-        guard let dir = resolvedSnapshotDirectory(storeRoot: storeRoot), Self.complete(dir) else { return weightSources }
-        return []
+        weightSources.filter { source in
+            if source.role == "upsampler" {
+                guard let dir = resolvedUpsamplerDirectory(storeRoot: storeRoot) else { return true }
+                return !Self.upsamplerComplete(dir)
+            }
+            if !snapshotPath.isEmpty, Self.complete(URL(fileURLWithPath: snapshotPath)) { return false }
+            guard let dir = resolvedSnapshotDirectory(storeRoot: storeRoot) else { return true }
+            return !Self.complete(dir)
+        }
     }
 
     /// The snapshot root: the explicit path, else the store's flat or revision directory.

@@ -16,6 +16,8 @@ let package = Package(
         // MLXEngine package: textToImage + imageEdit (PackageID flux-3-klein). C7 = LicenseRef-FLUX-Kommunity-1.0,
         // package-local, never allowlisted (AB-D-0151).
         .library(name: "MLXFlux3Klein", targets: ["MLXFlux3Klein"]),
+        // BFL's prompt upsampler (Apache-2.0 Qwen3.5-9B VL fine-tune) on MLXVLM: short request → full scene caption.
+        .library(name: "Flux3KleinUpsampler", targets: ["Flux3KleinUpsampler"]),
         .executable(name: "Flux3KleinGate", targets: ["Flux3KleinGate"]),
     ],
     dependencies: [
@@ -26,6 +28,8 @@ let package = Package(
         .package(url: "https://github.com/xocialize/qwen3vl-mlx-swift", from: "0.6.0"),
         // The FLUX.2 VAE (FLUX 3 ships identical weights, AB-R-0571); ≥ 0.5.0 for Flux2VAEEncoder.
         .package(url: "https://github.com/xocialize/flux2-vae-mlx-swift", from: "0.7.0"),
+        // MLXVLM (Qwen3.5 VL) for the prompt upsampler.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.32.3"),
         // MLXEngine contract (MLXToolKit) + conformance gates, for the wrapper only.
         .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.65.4"),
     ],
@@ -44,9 +48,20 @@ let package = Package(
             path: "Sources/Flux3Klein"
         ),
         .target(
-            name: "MLXFlux3Klein",
+            name: "Flux3KleinUpsampler",
             dependencies: [
                 "Flux3Klein",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXVLM", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/Flux3KleinUpsampler"
+        ),
+        .target(
+            name: "MLXFlux3Klein",
+            dependencies: [
+                "Flux3Klein", "Flux3KleinUpsampler",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Flux2VAE", package: "flux2-vae-mlx-swift"),
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
@@ -64,7 +79,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "Flux3KleinGate",
-            dependencies: ["Flux3Klein", "MLXFlux3Klein", .product(name: "MLX", package: "mlx-swift"),
+            dependencies: ["Flux3Klein", "MLXFlux3Klein", "Flux3KleinUpsampler", .product(name: "MLX", package: "mlx-swift"),
                            .product(name: "Flux2VAE", package: "flux2-vae-mlx-swift"),
                            .product(name: "MLXToolKit", package: "mlx-engine-swift")],
             path: "Sources/Flux3KleinGate"

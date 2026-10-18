@@ -11,6 +11,7 @@
 
 import Flux2VAE
 import Flux3Klein
+import Flux3KleinUpsampler
 import Foundation
 import MLX
 import MLXToolKit
@@ -73,24 +74,69 @@ public enum Flux3KleinEnvelope {
     }
 }
 
-/// The DiT and VAE stay resident. The conditioner loads per request and is released before denoising, unless
-/// `keepEncoderResident` is set.
+/// Package-specific `metaData` levers (contract C5).
+public enum Flux3KleinMetaKeys {
+    /// Bool. `false` sends the prompt to the image model as typed (for a caller that wrote a full scene caption).
+    /// Absent = upsample when the configuration has an upsampler.
+    public static let upsample = "upsample"
+    /// Array of objects: layout boxes on 0–1 coordinates, `{"id", "bbox": [y_min, x_min, y_max, x_max], "desc"}`, or
+    /// box edits `{"id", "from": "ref_image_n" | "target", "src_bbox", "tgt_bbox" (null removes), "desc"}`.
+    public static let boxes = "boxes"
+
+    static func upsample(_ meta: MetaData) throws -> Bool? {
+        switch meta[upsample] {
+        case nil, .null?: return nil
+        case .bool(let b)?: return b
+        default: throw PackageError.unsupportedRequestFeature("metaData[\"\(upsample)\"] must be a boolean")
+        }
+    }
+
+    static func boxes(_ meta: MetaData) throws -> [Flux3Box]? {
+        guard let value = meta[boxes], value != .null else { return nil }
+        guard case .array(let items) = value else {
+            throw PackageError.unsupportedRequestFeature("metaData[\"\(boxes)\"] must be an array of box objects")
+        }
+        func numbers(_ v: MetaValue?) throws -> [Double]? {
+            guard let v, v != .null else { return nil }
+            guard case .array(let a) = v else { throw PackageError.unsupportedRequestFeature("a box is a list of 4 numbers") }
+            return try a.map {
+                switch $0 {
+                case .double(let d): return d
+                case .int(let i): return Double(i)
+                default: throw PackageError.unsupportedRequestFeature("a box is a list of 4 numbers")
+                }
+            }
+        }
+        return try items.map { item in
+            guard case .object(let o) = item else { throw PackageError.unsupportedRequestFeature("each box is an object") }
+            func str(_ k: String) -> String? { if case .string(let s)? = o[k] { return s }; return nil }
+            return Flux3Box(id: str("id"), desc: str("desc"), bbox: try numbers(o["bbox"]), from: str("from"),
+                            srcBBox: try numbers(o["src_bbox"]), tgtBBox: try numbers(o["tgt_bbox"]))
+        }
+    }
+}
+
+/// The DiT and VAE stay resident. The prompt upsampler (when configured) and then the conditioner load per request and
+/// are released before denoising, unless `keepEncoderResident` is set.
 @InferenceActor
 final class Flux3KleinGenerator {
     let pipeline: Flux3KleinPipeline
     let snapshot: URL
     let keepEncoderResident: Bool
     let textEncoderQuant: Flux3TextEncoderQuant
+    let upsamplerDirectory: URL?
     private var residentEncoder: Flux3TextEncoder?
 
-    init(pipeline: Flux3KleinPipeline, snapshot: URL, keepEncoderResident: Bool, textEncoderQuant: Flux3TextEncoderQuant) {
+    init(pipeline: Flux3KleinPipeline, snapshot: URL, keepEncoderResident: Bool, textEncoderQuant: Flux3TextEncoderQuant,
+         upsamplerDirectory: URL?) {
         self.pipeline = pipeline
         self.snapshot = snapshot
         self.keepEncoderResident = keepEncoderResident
         self.textEncoderQuant = textEncoderQuant
+        self.upsamplerDirectory = upsamplerDirectory
     }
 
-    static func load(configuration c: Flux3KleinConfiguration, snapshot: URL) throws -> Flux3KleinGenerator {
+    static func load(configuration c: Flux3KleinConfiguration, snapshot: URL, upsampler: URL?) throws -> Flux3KleinGenerator {
         let quant: Flux3Quant
         switch c.quant {
         case .bf16: quant = .bf16
@@ -106,7 +152,7 @@ final class Flux3KleinGenerator {
         let pipeline = Flux3KleinPipeline(transformer: transformer, textEncoder: nil, vaeEncoder: vaeEncoder, vae: vae,
                                           snapshot: snapshot)
         return Flux3KleinGenerator(pipeline: pipeline, snapshot: snapshot, keepEncoderResident: c.keepEncoderResident,
-                                   textEncoderQuant: c.textEncoderQuant)
+                                   textEncoderQuant: c.textEncoderQuant, upsamplerDirectory: upsampler)
     }
 
     /// The prompt's conditioning. A per-request encoder is created and dropped inside this scope, so it never lives
@@ -123,6 +169,24 @@ final class Flux3KleinGenerator {
     private func loadEncoder() async throws -> Flux3TextEncoder {
         try await Flux3TextEncoder.load(directory: snapshot.appendingPathComponent("text_encoder"),
                                         quant: textEncoderQuant)
+    }
+
+    /// The caption the image model gets, as the reference's `generate.generate` builds it: a finished caption (box
+    /// table cited in full) goes as it is; otherwise the upsampler writes it (boxes reconciled); without one, boxes are
+    /// appended to the prompt on the 0–1000 canvas.
+    func caption(for prompt: String, references: [Flux3RGBAImage], boxes: [Flux3Box]?, upsample: Bool) async throws -> String {
+        let finished = (boxes?.isEmpty ?? true) && Flux3Boxes.isFinished(prompt)
+        if upsample, !finished, let dir = upsamplerDirectory {
+            // Loaded and dropped inside this scope, so it never lives into the encoder or the denoise loop.
+            let caption = try await Flux3PromptUpsampler.load(directory: dir)
+                .upsample(prompt, references: references, boxes: boxes)
+            MLX.Memory.clearCache()
+            return caption
+        }
+        if let boxes, !boxes.isEmpty {
+            return "\(prompt.trimmingTrailingSpace()) \(Flux3JSON.array(try Flux3Boxes.toCanvas(boxes)).dumps())"
+        }
+        return prompt
     }
 
     func generate(_ request: Flux3KleinPipeline.Request) async throws -> Flux3KleinPipeline.Result {
@@ -144,38 +208,51 @@ enum Flux3KleinServing {
         guard let snapshot = c.resolvedSnapshotDirectory(storeRoot: c.modelsRootDirectory),
               Flux3KleinConfiguration.complete(snapshot)
         else { throw Flux3KleinPackageError.unreadableSnapshot(c.snapshotPath.isEmpty ? Flux3KleinConfiguration.repo : c.snapshotPath) }
-        return try Flux3KleinGenerator.load(configuration: c, snapshot: snapshot)
+        var upsampler: URL? = nil
+        if c.upsampler != .off {
+            guard let dir = c.resolvedUpsamplerDirectory(storeRoot: c.modelsRootDirectory),
+                  Flux3KleinConfiguration.upsamplerComplete(dir)
+            else { throw Flux3KleinPackageError.unreadableSnapshot(c.upsamplerPath.isEmpty ? c.upsampler.repo ?? "" : c.upsamplerPath) }
+            upsampler = dir
+        }
+        return try Flux3KleinGenerator.load(configuration: c, snapshot: snapshot, upsampler: upsampler)
     }
 
     static func run(_ request: any CapabilityRequest, generator: Flux3KleinGenerator,
                     configuration c: Flux3KleinConfiguration) async throws -> any CapabilityResponse {
         let prompt: String
-        let references: [Flux3RGBImage]
+        let originals: [Flux3RGBAImage]
         let width: Int?, height: Int?, steps: Int?, seed: UInt64?
+        let meta: MetaData
         switch request.capability {
         case .textToImage:
             guard let t2i = request as? T2IRequest else { throw PackageError.unsupportedCapability(request.capability) }
-            prompt = t2i.prompt; references = []
+            prompt = t2i.prompt; originals = []
             width = t2i.width ?? 1024; height = t2i.height ?? 1024
-            steps = t2i.steps; seed = t2i.seed
+            steps = t2i.steps; seed = t2i.seed; meta = t2i.metaData
         case .imageEdit:
             guard let edit = request as? IEditRequest else { throw PackageError.unsupportedCapability(request.capability) }
             guard !edit.images.isEmpty else { throw Flux3KleinPackageError.imageDecode }
             prompt = edit.prompt
-            references = try edit.images.map { img in
-                do { return try Flux3RGBImage.read(data: img.data) } catch { throw Flux3KleinPackageError.imageDecode }
+            originals = try edit.images.map { img in
+                do { return try Flux3RGBAImage.read(data: img.data) } catch { throw Flux3KleinPackageError.imageDecode }
             }
             width = edit.width; height = edit.height
-            steps = edit.steps; seed = edit.seed
+            steps = edit.steps; seed = edit.seed; meta = edit.metaData
         default:
             throw PackageError.unsupportedCapability(request.capability)
         }
+        let references = originals.map(Flux3RGBImage.init)
         if let why = Flux3KleinEnvelope.violation(width: width, height: height, referenceCount: references.count) {
             throw Flux3KleinPackageError.outsideMeasuredEnvelope(why)
         }
+        let boxes = try Flux3KleinMetaKeys.boxes(meta)
+        let upsample = try Flux3KleinMetaKeys.upsample(meta) ?? true
         try Task.checkCancellation()
+        let caption = try await generator.caption(for: prompt, references: originals, boxes: boxes, upsample: upsample)
+        try Task.checkCancellation()  // post-upsample seam
         var req = Flux3KleinPipeline.Request(
-            prompt: prompt, references: references, width: width, height: height, steps: steps ?? c.defaultSteps,
+            prompt: caption, references: references, width: width, height: height, steps: steps ?? c.defaultSteps,
             seed: seed.map { UInt32(truncatingIfNeeded: $0) })
         req.referenceMaxPixels = Flux3KleinEnvelope.maxReferencePixels
         let result = try await generator.generate(req)

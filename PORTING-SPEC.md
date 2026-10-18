@@ -1,6 +1,6 @@
 # flux3-klein-swift — Porting spec: FLUX 3 Image Klein → Swift/MLX
 
-Status: **P0–P3 and P5 done 2026-10-17** (served by Pixel Agency Image Engine 0.2.12, named-only). The engine-free pipeline is gated end to end; quant tiers have passed the OCR gate,
+Status: **P0–P5 done 2026-10-18** (served by Pixel Agency Image Engine 0.2.12, named-only). The engine-free pipeline is gated end to end; quant tiers have passed the OCR gate,
 footprints are measured, and the weights are on mlx-community. P5 (engine package) comes next (the spec was written the same day, four days after release). It is a
 **restricted, named-only tier for the Pixel Agency Image Engine** (`pixel-agency-image-engine`, with its MES HTTP and MCP
 bindings), not a product
@@ -279,7 +279,14 @@ it is ≈ 13 GB, before the upsampler.
   - **Envelope:** a single reference fitted to 2048² (the reference's 4 MiP). The worst request is 10 refs into 2048²,
     10.32 GB, so the declared 12.0 GB holds. phys peaks bf16 22.8 GB, int4 16.0 GB.
 
-**P4 — upsampler**
+**P4 done (2026-10-18).**
+- `Flux3KleinUpsampler` on MLXVLM. Prompt tokens are exact vs HF, `bbox.py` is ported (13/13), and one edit caption
+  matches BFL's word for word.
+- Tiers bf16 / int8 / int4 are on mlx-community; all keep quoted text and box tables. int8 is the package default:
+  its 11.1 GB transient sits under the declared activation.
+- In the package: per request, with the `upsample` / `boxes` metaData levers (README).
+
+**P4 plan (kept for the record)**
 - Convert the upsampler (Qwen3.5-9B VL) to MLX int4/int8 and run it through `MLXVLM`, using
   `system_prompts.json` (`t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`) with greedy decoding and thinking off.
 - Gate the captions against the reference's vLLM captions on the shipped examples. Score the

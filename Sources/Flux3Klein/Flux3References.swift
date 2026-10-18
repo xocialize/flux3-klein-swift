@@ -47,23 +47,31 @@ public struct Flux3RGBImage: Sendable {
 
     /// Decode in-memory PNG/JPEG data, apply its EXIF orientation and drop alpha (an engine request's image).
     public static func read(data: Data) throws -> Flux3RGBImage {
-        let image = Flux3RGBImage(try Flux3PNG.read(data: data))
-        var orientation = 1
-        if let src = CGImageSourceCreateWithData(data as CFData, nil),
-           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
-           let o = props[kCGImagePropertyOrientation] as? Int {
-            orientation = o
-        }
-        return image.oriented(orientation)
+        Flux3RGBImage(try Flux3RGBAImage.read(data: data))
     }
 
     /// PIL `exif_transpose` for EXIF orientation 1–8.
     public func oriented(_ orientation: Int) -> Flux3RGBImage {
-        guard (2...8).contains(orientation) else { return self }
-        let (w, h) = (width, height)
+        let (px, ow, oh) = Flux3Orientation.apply(rgb, width: width, height: height, channels: 3, orientation: orientation)
+        return Flux3RGBImage(rgb: px, width: ow, height: oh)
+    }
+
+    /// EXIF orientation of encoded image data (1 when absent).
+    static func orientation(_ data: Data) -> Int {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let o = props[kCGImagePropertyOrientation] as? Int else { return 1 }
+        return o
+    }
+}
+
+/// `ImageOps.exif_transpose` over interleaved pixels of any channel count.
+enum Flux3Orientation {
+    static func apply(_ px: [UInt8], width w: Int, height h: Int, channels n: Int, orientation: Int) -> ([UInt8], Int, Int) {
+        guard (2...8).contains(orientation) else { return (px, w, h) }
         let swap = orientation >= 5
         let (ow, oh) = swap ? (h, w) : (w, h)
-        var out = [UInt8](repeating: 0, count: ow * oh * 3)
+        var out = [UInt8](repeating: 0, count: ow * oh * n)
         for y in 0..<oh {
             for x in 0..<ow {
                 let (sx, sy): (Int, Int)
@@ -76,12 +84,15 @@ public struct Flux3RGBImage: Sendable {
                 case 7: (sx, sy) = (w - 1 - y, h - 1 - x)    // TRANSVERSE
                 default: (sx, sy) = (w - 1 - y, x)           // 8: ROTATE_90
                 }
-                let s = (sy * w + sx) * 3, d = (y * ow + x) * 3
-                out[d] = rgb[s]; out[d + 1] = rgb[s + 1]; out[d + 2] = rgb[s + 2]
+                let s = (sy * w + sx) * n, d = (y * ow + x) * n
+                for c in 0..<n { out[d + c] = px[s + c] }
             }
         }
-        return Flux3RGBImage(rgb: out, width: ow, height: oh)
+        return (out, ow, oh)
     }
+}
+
+extension Flux3RGBImage {
 
     /// PIL `resize((w, h), LANCZOS)`.
     public func resized(width w: Int, height h: Int) -> Flux3RGBImage {
@@ -147,6 +158,17 @@ public struct Flux3RGBImage: Sendable {
     }
 
     public func write(to url: URL) throws { try Flux3PNG.write(rgba(), to: url) }
+}
+
+extension Flux3RGBAImage {
+    /// Decode in-memory PNG/JPEG data with its EXIF orientation applied, alpha kept (the upsampler composites it over
+    /// white).
+    public static func read(data: Data) throws -> Flux3RGBAImage {
+        let image = try Flux3PNG.read(data: data)
+        let (px, w, h) = Flux3Orientation.apply(image.rgba, width: image.width, height: image.height, channels: 4,
+                                                orientation: Flux3RGBImage.orientation(data))
+        return Flux3RGBAImage(rgba: px, width: w, height: h)
+    }
 }
 
 public enum Flux3References {

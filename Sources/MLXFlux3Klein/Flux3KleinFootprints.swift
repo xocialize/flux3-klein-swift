@@ -53,6 +53,10 @@ enum Flux3KleinFootprints {
     ]
 
     /// The text-only conditioner's weights, added to the resident term when it is kept resident.
+    /// The bf16 prompt upsampler's per-request transient (20.16 GB MLX peak, pool capped at 2 GB, P4), declared +3.7 %.
+    /// int8 (11.06 GB) and int4 (6.79 GB) stay under the declared activation.
+    static let bf16UpsamplerPeakActivationBytes: UInt64 = 20_900_000_000
+
     static func encoderBytes(_ quant: Flux3TextEncoderQuant) -> UInt64 {
         quant == .int8 ? 4_900_000_000 : 8_300_000_000
     }

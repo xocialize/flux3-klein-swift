@@ -48,9 +48,45 @@ package is `MLXFlux3Klein` (below); its registration in Pixel Agency Image Engin
 | mug print, 2-ref composition, 1024² | 52.7 dB | 56.2 dB | 61.7 s |
 | figurine on a desk, 1-ref edit, 896×1120 | 30.9 dB | — | 44.3 s |
 
-Prompting: the model wants a **full scene caption**. Run a prompt upsampler first: BFL's
-[flux-3-image-klein-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup), or any LLM given its
-`system_prompts.json`. Boxes go after the caption as a JSON list on a 0–1000 grid.
+Prompting: the model wants a **full scene caption**. The package writes it for you: by default every request goes
+through BFL's prompt upsampler first (`Flux3KleinUpsampler`, below). A caller that wrote its own caption sends
+`metaData["upsample"] = false`.
+
+## Prompt upsampler (`Flux3KleinUpsampler`, P4)
+
+`Flux3PromptUpsampler` ports BFL's `flux3/pup.py` to MLXVLM's Qwen3.5. The model is BFL's Apache-2.0
+[flux-3-image-klein-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup), a Qwen3.5-9B VL fine-tune. It
+turns a short request, plus up to 10 references and optional boxes, into the caption.
+- **Prompt:** the system prompt by mode (`t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`), the edit and box scaffolds, and the chat
+  template with thinking off.
+- **Decoding:** greedy, with a presence penalty of 1.5 (t2i) or 0 (edits) on **generated tokens only**, as vLLM does.
+  MLXLMCommon's own penalty would also count the prompt.
+- **References:** prepared as the reference does (alpha over white, LANCZOS to the budget, JPEG q92).
+- **Boxes:** box planning and `reconcile` are ported (`Flux3Boxes`).
+
+| Check | Result |
+|---|---|
+| Prompt tokens vs the HF processor (5 cases, 737–1,914 tokens) | exact |
+| `bbox.py` port (plan / detect / is_finished / reconcile / to_canvas) | 13/13 exact |
+| 1-ref edit caption on BFL's reference pixels | word-for-word BFL's caption |
+| t2i caption (man_dog) | 0.991 similar to BFL's (BFL's own reruns: 0.25–1.0) |
+
+**Tiers** ([mlx-community collection](https://huggingface.co/collections/mlx-community/flux-3-image-klein-mlx-6ad47ef381d571b4a65c790b)),
+over BFL's 19 example requests. Every tier keeps 20/20 quoted strings verbatim and 2/2 box tables complete
+(`mlxengine-image/WIP/flux3-klein-pup-gate`):
+
+| Tier | MLX peak | Similarity to bf16 | |
+|---|---|---|---|
+| bf16 | 20.2 GB | 1.00 | over the declared activation: declared via a hint |
+| **int8** (default) | 11.1 GB | 0.68 | under the declared 12.0 GB activation |
+| int4 | 6.8 GB | 0.45 | paraphrases more, same structure and quoted text |
+
+**In the package:**
+- `Flux3KleinConfiguration.upsampler` picks the tier: `.int8` by default, or `.off`.
+- The upsampler loads per request (about 10 s per caption) and is released before the encoder.
+- A finished caption, one whose box table is cited in full, is sent as is.
+- `metaData["boxes"]` takes layout or box-edit boxes on 0–1 coordinates.
+- Live: a one-line request, "a hand-painted shop sign that says OPEN LATE", renders in 23.8 s at 11.72 GB activation.
 
 ## MLXEngine package (`MLXFlux3Klein`)
 
