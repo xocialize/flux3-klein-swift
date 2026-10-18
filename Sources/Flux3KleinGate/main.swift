@@ -5,6 +5,8 @@
 //   Flux3KleinGate --e2e <snapshot> <oracleDir> <example.json>... [--mlx-noise]
 //   Flux3KleinGate --oneshot <snapshot> <oracleDir> --dit bf16|int8|int4 --te bf16|int8 --case t2i|ref1|ref4|ref4mp
 //                  [--steps 2] [--drop-te] [--hold 6]   (footprint ledger: load, one request, hold for `footprint`)
+//   Flux3KleinGate --package <snapshot> <oracleDir> [--quant int8] [--steps 16]   (the ModelPackage path: load, T2I and
+//                  a 1-ref edit through run(), PNGs to outputs/package/, and an envelope refusal)
 //   Flux3KleinGate --vae <snapshot> <goldensDir> [--gpu]
 //   Flux3KleinGate --encoder <snapshot> <goldensDir> [--gpu] [--bf16]
 //   Flux3KleinGate --dit <snapshot> <goldensDir> [--case t2i|ref1|ref3] [--gpu] [--quant int8|int4]
@@ -22,6 +24,8 @@ import Foundation
 import Flux2VAE
 import Flux3Klein
 import MLX
+import MLXFlux3Klein
+import MLXToolKit
 
 setbuf(stdout, nil)
 
@@ -279,6 +283,17 @@ func oneshot(snapshot: URL, oracle: URL) async throws {
     case "ref4mp": refs = [try img(2).resized(width: 2048, height: 2048)]
     default: break
     }
+    // Generic envelope probes: --refs N (multi-ref when N > 1) at --ref-size S², output --size WxH.
+    if let n = arg("--refs").flatMap(Int.init), n > 0 {
+        let side = Int(arg("--ref-size") ?? "1024")!
+        let pool = [try img(2), try img(3), try img(1)]
+        refs = (0..<n).map { pool[$0 % pool.count].resized(width: side, height: side) }
+    }
+    var outW: Int? = refs.isEmpty ? 1024 : nil, outH: Int? = refs.isEmpty ? 1024 : nil
+    if let size = arg("--size") {
+        let parts = size.split(separator: "x").compactMap { Int($0) }
+        outW = parts[0]; outH = parts[1]
+    }
     let prompt = "A ceramic mug on a wooden desk by a window, morning light, a small sign that reads OPEN LATE."
     Memory.peakMemory = 0
     t0 = Date()
@@ -288,8 +303,8 @@ func oneshot(snapshot: URL, oracle: URL) async throws {
     if has("--drop-te") { pipe.releaseTextEncoder(); Memory.clearCache() }
     let residentDiT = Memory.activeMemory
     Memory.peakMemory = 0
-    let req = Flux3KleinPipeline.Request(prompt: prompt, references: refs, width: refs.isEmpty ? 1024 : nil,
-                                         height: refs.isEmpty ? 1024 : nil, steps: steps, seed: 1)
+    let req = Flux3KleinPipeline.Request(prompt: prompt, references: refs, width: outW, height: outH, steps: steps,
+                                         seed: 1)
     let r = try pipe.generate(req, conditioning: conditioning)
     let secs = Date().timeIntervalSince(t0)
     print(String(format: "oneshot dit=%@ te=%@ case=%@ %dx%d steps=%d drop-te=%@ | load %.1fs | MLX resident (all) %.2f GB, "
@@ -298,6 +313,42 @@ func oneshot(snapshot: URL, oracle: URL) async throws {
                  gb(residentAll), gb(residentDiT), gb(encodePeak), gb(Memory.peakMemory), secs,
                  r.timings.sorted { $0.key < $1.key }.map { String(format: "%@ %.1fs", $0.key, $0.value) }.joined(separator: ", ")))
     if let hold = arg("--hold").flatMap(Double.init) { try await Task.sleep(for: .seconds(hold)) }
+}
+
+@InferenceActor
+func packageSmoke(snapshot: URL, oracle: URL) async throws {
+    let quant = Quant(rawValue: arg("--quant") ?? "bf16") ?? .bf16
+    let steps = Int(arg("--steps") ?? "16")!
+    let package = Flux3KleinPackage(configuration: Flux3KleinConfiguration(quant: quant, snapshotPath: snapshot.path))
+    var t0 = Date()
+    try await package.load()
+    print(String(format: "package loaded (%@) in %.1fs, MLX active %.2f GB", quant.rawValue, Date().timeIntervalSince(t0),
+                 Double(Memory.activeMemory) / 1e9))
+    let out = URL(fileURLWithPath: "outputs/package")
+    try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    let caption = "A hand-painted wooden shop sign that reads \"OPEN LATE\" in cream serif letters on deep green, "
+        + "hanging from a wrought-iron bracket on a brick wall, warm evening light from the left, shallow depth of field."
+    t0 = Date()
+    let t2i = try await package.run(T2IRequest(prompt: caption, width: 1184, height: 896, steps: steps, seed: 7))
+    guard let image = (t2i as? T2IResponse)?.image else { failures += 1; print("FAIL t2i: no image"); return }
+    try image.data.write(to: out.appendingPathComponent("t2i-\(quant.rawValue).png"))
+    print(String(format: "  PASS t2i %dx%d in %.1fs", image.width ?? 0, image.height ?? 0, Date().timeIntervalSince(t0)))
+    let photo = try Data(contentsOf: oracle.appendingPathComponent("ref/examples/inputs/2.png"))
+    let editCaption = "A photograph of the same sunlit wooden windowsill and white mug, now filled with black coffee, "
+        + "with a golden croissant beside the mug and a few crumbs on the wood; same camera position and light."
+    t0 = Date()
+    let edit = try await package.run(IEditRequest(images: [Image(format: .png, data: photo)], prompt: editCaption,
+                                                  steps: steps, seed: 21))
+    guard let edited = (edit as? IEditResponse)?.image else { failures += 1; print("FAIL edit: no image"); return }
+    try edited.data.write(to: out.appendingPathComponent("edit-\(quant.rawValue).png"))
+    print(String(format: "  PASS edit %dx%d in %.1fs", edited.width ?? 0, edited.height ?? 0, Date().timeIntervalSince(t0)))
+    do {
+        _ = try await package.run(T2IRequest(prompt: "x", width: 2048, height: 2048, steps: 1))
+        failures += 1; print("  FAIL envelope: 2048² was not refused")
+    } catch let error as Flux3KleinPackageError {
+        print("  PASS envelope refusal: \(error.localizedDescription)")
+    }
+    await package.unload()
 }
 
 func tokens(_ g: [String: MLXArray]) -> Flux3Tokens {
@@ -374,6 +425,9 @@ do {
         let p = positional(after: "--render-cache", 4)
         try renderCache(snapshot: p[0], prompts: p[1], condDir: p[2], outDir: p[3],
                         dit: Flux3Quant(rawValue: arg("--dit") ?? "bf16")!)
+    } else if has("--package") {
+        let p = positional(after: "--package", 2)
+        try await packageSmoke(snapshot: p[0], oracle: p[1])
     } else if has("--oneshot") {
         let p = positional(after: "--oneshot", 2)
         try await oneshot(snapshot: p[0], oracle: p[1])

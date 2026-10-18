@@ -53,6 +53,9 @@ public final class Flux3KleinPipeline {
         public var alpha: Double
         /// nil = sha256(prompt) mod 2³², as the reference does.
         public var seed: UInt32?
+        /// A single reference is fitted to this area (the reference's 4 MiP by default; engine packages cap it to
+        /// their measured envelope).
+        public var referenceMaxPixels: Int = Flux3References.matchMaxPixels
 
         public init(prompt: String, references: [Flux3RGBImage] = [], width: Int? = nil, height: Int? = nil,
                     steps: Int = Flux3Schedule.defaultSteps, alpha: Double = Flux3Schedule.defaultAlpha,
@@ -94,7 +97,7 @@ public final class Flux3KleinPipeline {
     /// released before denoising; nil encodes here.
     public func generate(_ request: Request, conditioning: Flux3TextEncoder.Encoded? = nil,
                          noise providedNoise: MLXArray? = nil,
-                         progress: ((Int, Int) -> Void)? = nil) throws -> Result {
+                         progress: ((Int, Int) throws -> Void)? = nil) throws -> Result {
         guard request.references.count <= Flux3References.maxReferences else {
             throw Flux3KleinError.invalidInput("at most \(Flux3References.maxReferences) references")
         }
@@ -112,7 +115,7 @@ public final class Flux3KleinPipeline {
         if request.references.count > 1 {
             references = request.references.map(Flux3References.prepareMulti)
         } else {
-            let prepared = request.references.map(Flux3References.prepareSingle)
+            let prepared = request.references.map { Flux3References.prepareSingle($0, maxPixels: request.referenceMaxPixels) }
             references = prepared.map(\.image)
             if request.width == nil && request.height == nil { crop = prepared.first?.box }
         }
@@ -159,7 +162,7 @@ public final class Flux3KleinPipeline {
     func denoiseAndDecode(features rawFeatures: MLXArray, textIDs: MLXArray, condTokens: [MLXArray],
                           condIDs: [MLXArray], width: Int, height: Int, steps: Int, alpha: Double, seed: UInt32,
                           noise providedNoise: MLXArray?, crop: Flux3References.Box?,
-                          progress: ((Int, Int) -> Void)?) throws -> Result {
+                          progress: ((Int, Int) throws -> Void)?) throws -> Result {
         var timings: [String: Double] = [:]
         var clock = Date()
         func lap(_ name: String) { timings[name] = Date().timeIntervalSince(clock); clock = Date() }
@@ -186,7 +189,7 @@ public final class Flux3KleinPipeline {
             let velocity = transformer(tokens, rope: rope, t: schedule[step], tNext: schedule[step + 1])
             x = Flux3Schedule.step(x, velocity: velocity, t: schedule[step], tNext: schedule[step + 1])
             eval(x)
-            progress?(step + 1, steps)
+            try progress?(step + 1, steps)  // a throwing callback cancels between steps
         }
         lap("denoise")
 

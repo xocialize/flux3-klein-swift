@@ -26,8 +26,8 @@ at `bfc8889`, Apache-2.0), not diffusers. The spec, the architecture delta from 
 ## Status
 
 The engine-free pipeline is **done and gated** (`Flux3KleinPipeline`): T2I, single- and multi-reference edits, box
-layouts in the caption, and three DiT tiers plus an int8 encoder tier, all within OCR tolerance of bf16. Next comes the
-MLXEngine package and its registration in Pixel Agency Image Engine (PORTING-SPEC.md P5).
+layouts in the caption, and three DiT tiers plus an int8 encoder tier, all within OCR tolerance of bf16. The MLXEngine
+package is `MLXFlux3Klein` (below); its registration in Pixel Agency Image Engine is PORTING-SPEC.md P5.
 
 **Weights:** [mlx-community/flux-3-image-klein-bf16](https://huggingface.co/mlx-community/flux-3-image-klein-bf16)
 (gated, FLUX Kommunity License): a byte-identical copy of BFL's bf16 package. Quant tiers are made at load.
@@ -51,6 +51,34 @@ MLXEngine package and its registration in Pixel Agency Image Engine (PORTING-SPE
 Prompting: the model wants a **full scene caption**. Run a prompt upsampler first: BFL's
 [flux-3-image-klein-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup), or any LLM given its
 `system_prompts.json`. Boxes go after the caption as a JSON list on a 0–1000 grid.
+
+## MLXEngine package (`MLXFlux3Klein`)
+
+`Flux3KleinPackage` serves `textToImage` and `imageEdit` (surface `flux-3-klein`) on one core. C0–C13:
+- **C7 licence:** `LicenseRef-FLUX-Kommunity-1.0`, package-local, never allowlisted (AB-D-0151). A `.permissiveOnly`
+  engine refuses or flags it.
+- **C8:** the port code is MIT.
+- **Weights:** `Flux3KleinConfiguration` materializes them from the gated mlx-community mirror, pinned by commit. Needs an
+  HF token whose account accepted the licence.
+- **Quant:** `quant` takes `.bf16`, `.int8` or `.int4`, made at load; `textEncoderQuant` sets the encoder tier.
+- **Memory path:** the encoder loads per request and is released before denoising, unless `keepEncoderResident` is set.
+
+**Envelope** (refused, not clamped, in `run()`):
+- output area ≤ **1152²** (1.33 MP), sides multiples of 16, at least 64 px;
+- a single reference is fitted to the same area;
+- up to 10 references.
+
+**Footprints** (MLX pool, measured on the package path at the cap, 2 GB pool cap; `Flux3KleinFootprints`):
+
+| DiT tier | Resident | Activation |
+|---|---|---|
+| bf16 | 11.7 GB | 15.5 GB (worst: 10 refs at 1152²) |
+| int8 | 6.7 GB | 15.5 GB |
+| int4 | 4.9 GB | 15.5 GB |
+
+Most of the activation is the fp32 VAE decode, about 10.7 GB per output MP, which is why the cap sits at 1.33 MP.
+Tests: 11 offline (manifest licence posture, footprints, envelope, MAT, CAN-1/2/3, configuration). Live:
+`Flux3KleinGate --package` (load, T2I, edit, envelope refusal) passes at bf16 and int4.
 
 ## Quant tiers (P3)
 

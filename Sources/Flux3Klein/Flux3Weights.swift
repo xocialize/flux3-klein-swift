@@ -8,7 +8,7 @@ import MLX
 import MLXNN
 
 /// DiT weight tier.
-public enum Flux3Quant: String, Sendable, CaseIterable {
+public enum Flux3Quant: String, Codable, Sendable, CaseIterable {
     case bf16, int8, int4
 
     public var bits: Int? {

@@ -21,7 +21,7 @@ import Qwen3VL
 import Tokenizers
 
 /// Text-encoder weight tier.
-public enum Flux3TextEncoderQuant: String, Sendable, CaseIterable {
+public enum Flux3TextEncoderQuant: String, Codable, Sendable, CaseIterable {
     case bf16, int8
 
     public var bits: Int? { self == .int8 ? 8 : nil }

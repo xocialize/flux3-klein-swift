@@ -234,6 +234,14 @@ it is ≈ 13 GB, before the upsampler.
   - Pre-quantized repos. The download-size optimization stays later, per the fleet convention.
   - Tiled or bf16 VAE decode. About 11 GB of the 1024² peak is the fp32 decode, the lever for 16–24 GB Macs.
 
+**P5a done (2026-10-17): the package.**
+- `MLXFlux3Klein` / `Flux3KleinPackage` (textToImage + imageEdit, surface `flux-3-klein`), C7 Kommunity LicenseRef.
+- Envelope: 1152² area, measured; single references fitted to it; ≤ 10 refs.
+- Footprints declared from the package-path ledger: resident bf16 11.7 / int8 6.7 / int4 4.9 GB, activation
+  15.5 GB.
+- 11 offline tests (MAT, CAN, manifest) pass; the live `--package` smoke passes at bf16 and int4.
+- P5b, registration in mlx-image-runtime and the engine, follows.
+
 **P4 — upsampler**
 - Convert the upsampler (Qwen3.5-9B VL) to MLX int4/int8 and run it through `MLXVLM`, using
   `system_prompts.json` (`t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`) with greedy decoding and thinking off.
