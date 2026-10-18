@@ -198,7 +198,7 @@ it is ≈ 13 GB, before the upsampler.
   - qwen3vl-mlx-swift 0.5.1 adds `hiddenStates(inputIds:layers:mask:positionIds:)`.
   - Pad rows: every pad row is the same token at position 1 attending to the real keys, so one masked pad row is
     run and broadcast. It is exact against the reference's padded forward.
-- VAE: flux2-vae-mlx-swift 0.5.0 (`Flux2VAEEncoder`).
+- VAE: flux2-vae-mlx-swift 0.5.0 (`Flux2VAEEncoder`); 0.6.0 from v0.3.0 (row-band decode).
 - Reference prep: byte-exact.
 - `Flux3KleinPipeline`.
 - bf16 GPU e2e vs BFL: 35.9 / 39.8 / 52.7 / 30.9 dB, where BFL's code on MPS scores 35.8 / 42.5 / 56.2.
@@ -250,8 +250,27 @@ it is ≈ 13 GB, before the upsampler.
     - bf16 phys peak 22 GB (declared 27.2), int8 17 GB (declared 22.2);
     - a commercial-only request is refused `policy_unmet`;
     - conformance 35/0 warm.
-  - Open: per-model prompting notes in MES (ask AB-A-0186 to mlx-apps); the tiled VAE decode (flux2-vae 0.6.0) to
-    widen the envelope.
+  - Open: per-model prompting notes in MES (ask AB-A-0186 to mlx-apps); ~~the tiled VAE decode (flux2-vae 0.6.0) to
+    widen the envelope~~ done in v0.3.0 (below).
+
+**v0.3.0 done (2026-10-17): the row-band decode widens the envelope to 2048² (AB-R-0579).**
+- `Flux3KleinPipeline` decodes with flux2-vae-mlx-swift 0.6.0's `decodePackedLatents(_:tile: .standard)` by default
+  (`vaeTile`; nil = untiled). No flag: the quality is the same.
+  - `--vae` (GPU fp32): the 512² decode golden at cos 1.0000000 / relMax 1.98e-3 tiled, as untiled; tiled vs untiled
+    relMax 5.8e-5 (64 MB and 4 MB bands).
+  - `--e2e`: PSNR vs BFL unchanged to 0.01 dB (35.88 / 39.80 / 52.70 / 30.91); tiled vs untiled renders
+    59.9–62.6 dB.
+- Each reference is evaluated as it is encoded. Lazily, ten 1024² encodes ran inside the first DiT step: 10 refs at
+  1024² went 14.81 → 8.11 GB activation from this alone (exact: eval only schedules).
+- Ledger (`outputs/envelope.sh`, package path, 2 GB pool, `outputs/envelope-v030.log`): 1024² … 2048² × 0 / 1 / 10
+  refs, bf16 and int4. The decode is now ~1.7 GB per output MP; 2048² T2I is 7.21 GB activation (was 45.02).
+  - What is left is the untiled fp32 VAE **encode** of a single reference, ~4.1 GB per reference MP: a 2048²
+    reference is 18.66 GB, which would put int4 at 24.5 GB declared, over a 24 GB Mac's 19.07 GB budget.
+- **Envelope:** output ≤ 2048² area; a single reference fitted to 1664² (2.77 MP); ≤ 10 refs. Worst request inside
+  it: 11.34 GB (a 1664² reference into any output up to 2048²); 10 refs into 2048²: 10.32 GB.
+- **Declared:** activation 12.0 GB on every tier (was 15.5). Totals: bf16 23.7, int8 18.7, int4 16.9 GB.
+  phys_footprint peaks: bf16 24.5 GB, int4 17.8 GB (was 28.2 / 21.4 at the 1152² cap).
+- Next lever: a row-band VAE **encode** (flux2-vae-mlx-swift) would let a single reference follow the output to 2048².
 
 **P4 — upsampler**
 - Convert the upsampler (Qwen3.5-9B VL) to MLX int4/int8 and run it through `MLXVLM`, using

@@ -39,14 +39,35 @@ final class Flux3KleinPackageTests: XCTestCase {
         XCTAssertNil(Flux3KleinEnvelope.violation(width: 1024, height: 1024, referenceCount: 10))
         XCTAssertNotNil(Flux3KleinEnvelope.violation(width: 1024, height: 1024, referenceCount: 11))
         XCTAssertNotNil(Flux3KleinEnvelope.violation(width: 1000, height: 1024, referenceCount: 0))  // not ×16
-        XCTAssertNotNil(Flux3KleinEnvelope.violation(width: 2048, height: 2048, referenceCount: 0))
+        XCTAssertNil(Flux3KleinEnvelope.violation(width: 2048, height: 2048, referenceCount: 10))  // measured, AB-R-0579
+        XCTAssertNil(Flux3KleinEnvelope.violation(width: 1440, height: 1920, referenceCount: 1))
+        XCTAssertNil(Flux3KleinEnvelope.violation(width: 1536, height: 2720, referenceCount: 0))  // 4.18 MP, non-square
+        XCTAssertNotNil(Flux3KleinEnvelope.violation(width: 2064, height: 2048, referenceCount: 0))
         XCTAssertNotNil(Flux3KleinEnvelope.violation(width: 1024, height: nil, referenceCount: 0))
+    }
+
+    /// v0.3.0 (row-band decode): output up to 2048², a single reference capped below it at the measured 1664².
+    func testEnvelopeCaps() {
+        XCTAssertEqual(Flux3KleinEnvelope.maxOutputPixels, 2048 * 2048)
+        XCTAssertEqual(Flux3KleinEnvelope.maxReferencePixels, 1664 * 1664)
+        XCTAssertLessThan(Flux3KleinEnvelope.maxReferencePixels, Flux3KleinEnvelope.maxOutputPixels)
+    }
+
+    /// The declaration keeps a 24 GB Mac's budget (19.07 GB, recommendedMaxWorkingSetSize on an M5 Pro, AB-R-0551) on
+    /// the int4 tier, and bf16 under 32 GB.
+    func testDeclaredFitsTheTargetMacs() {
+        let fp = Dictionary(uniqueKeysWithValues: Flux3KleinFootprints.declared.map { ($0.quant, $0) })
+        let total = { (q: Quant) in fp[q]!.residentBytes + fp[q]!.peakActivationBytes }
+        XCTAssertLessThanOrEqual(total(.int4), 19_070_000_000)
+        XCTAssertLessThanOrEqual(total(.bf16), 32_000_000_000)
+        XCTAssertGreaterThanOrEqual(fp[.bf16]!.peakActivationBytes, 11_340_000_000)  // the measured worst request
     }
 
     /// A single reference is fitted to the envelope, so an un-sized edit never leaves it.
     func testSingleReferenceFitsTheEnvelope() {
-        let (_, canvas) = Flux3References.canvas(width: 4000, height: 3000, maxPixels: Flux3KleinEnvelope.maxOutputPixels)
-        XCTAssertLessThanOrEqual(canvas.0 * canvas.1, Flux3KleinEnvelope.maxOutputPixels)
+        let (_, canvas) = Flux3References.canvas(width: 4000, height: 3000, maxPixels: Flux3KleinEnvelope.maxReferencePixels)
+        XCTAssertLessThanOrEqual(canvas.0 * canvas.1, Flux3KleinEnvelope.maxReferencePixels)
+        XCTAssertNil(Flux3KleinEnvelope.violation(width: canvas.0, height: canvas.1, referenceCount: 1))
         XCTAssertEqual(canvas.0 % 16, 0)
         XCTAssertEqual(canvas.1 % 16, 0)
     }

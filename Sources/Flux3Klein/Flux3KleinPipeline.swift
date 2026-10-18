@@ -4,7 +4,8 @@
 //
 // Precision follows the reference under CUDA autocast: the DiT runs in bf16 with bf16 text features, bf16 reference
 // tokens and bf16-rounded timesteps; the image tokens stay fp32 across the Euler steps (bf16-rounded noise); the VAE
-// runs in fp32.
+// runs in fp32, in row bands by default (flux2-vae-mlx-swift 0.6.0, AB-R-0577): the same image as the untiled decode
+// to float reassociation, at a fraction of its peak (10.7 → 2.4 GB at 1024²).
 
 import CryptoKit
 import Flux2VAE
@@ -18,6 +19,8 @@ public final class Flux3KleinPipeline {
     public let vaeEncoder: Flux2VAEEncoder
     public let vae: Flux2VAE
     public let snapshot: URL
+    /// Row-band size for the fp32 VAE decode; nil decodes the whole latent at once (about 4× the peak).
+    public var vaeTile: Flux2VAETile? = .standard
 
     public init(transformer: Flux3Transformer, textEncoder: Flux3TextEncoder?, vaeEncoder: Flux2VAEEncoder,
                 vae: Flux2VAE, snapshot: URL) {
@@ -129,6 +132,7 @@ public final class Flux3KleinPipeline {
         for (n, reference) in references.enumerated() {
             let packed = vaeEncoder.encodePacked(reference.pixelsNCHW())
             condTokens.append(Flux3Latents.tokens(fromPacked: packed).asType(dtype))
+            eval(condTokens[n])  // one encoder transient at a time, never stacked into the first DiT step
             condIDs.append(Flux3Latents.ids(height: packed.dim(2), width: packed.dim(3), l: -Float(1 + n)))
         }
         lap("references")
@@ -194,7 +198,8 @@ public final class Flux3KleinPipeline {
         lap("denoise")
 
         // Decode (fp32), crop back to a padded single reference's box.
-        let decoded = vae.decodePackedLatents(Flux3Latents.packed(fromTokens: x, height: lh, width: lw))
+        let packed = Flux3Latents.packed(fromTokens: x, height: lh, width: lw)
+        let decoded = vaeTile.map { vae.decodePackedLatents(packed, tile: $0) } ?? vae.decodePackedLatents(packed)
         var image = Flux3RGBImage.fromPixels(decoded[0])
         if let crop { image = image.cropped(left: crop.left, top: crop.top, width: crop.width, height: crop.height) }
         lap("decode")

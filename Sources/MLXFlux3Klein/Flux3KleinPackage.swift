@@ -44,15 +44,18 @@ public enum Flux3KleinPackageError: Error, LocalizedError {
 /// The input envelope the manifest's footprint was measured at (Flux3KleinFootprints). `run()` refuses anything
 /// outside it, so the declaration stays an upper bound (AB-L-0202).
 public enum Flux3KleinEnvelope {
-    /// Output area cap. A single reference is fitted to the same area, where the reference allows 4 MiP: above this,
-    /// the fp32 VAE decode and the 2× longer sequence put a 2048² request at 51–58 GB phys (AB-R-0576).
+    /// Output area cap (2048², 4.19 MP). The row-band decode made the output cheap (~1.7 GB per MP, AB-R-0577).
     public static let maxOutputPixels = Flux3KleinFootprints.envelopeMaxPixels
+    /// A single reference is fitted to this area (1664², 2.77 MP) where the reference allows 4 MiP: its fp32 VAE
+    /// encode is untiled, ~4.1 GB per MP, and a 2048² reference would take the activation from 11.3 to 18.7 GB (AB-R-0579).
+    /// Several references are each fitted under 1 MiP by the model itself.
+    public static let maxReferencePixels = Flux3KleinFootprints.envelopeReferenceMaxPixels
     public static let minSide = 64
     /// The model's maximum, measured at 1024² references.
     public static let maxReferenceImages = Flux3References.maxReferences
 
     /// nil when inside the envelope, else a user-facing reason. `width`/`height` are the requested size (nil = the
-    /// first reference's prepared size, which `referenceMaxPixels` already keeps inside the cap, or 1024²).
+    /// first reference's prepared size, which `maxReferencePixels` keeps inside the cap, or 1024²).
     public static func violation(width: Int?, height: Int?, referenceCount: Int) -> String? {
         if referenceCount > maxReferenceImages {
             return "FLUX 3 Image Klein accepts at most \(maxReferenceImages) reference images; got \(referenceCount)."
@@ -174,7 +177,7 @@ enum Flux3KleinServing {
         var req = Flux3KleinPipeline.Request(
             prompt: prompt, references: references, width: width, height: height, steps: steps ?? c.defaultSteps,
             seed: seed.map { UInt32(truncatingIfNeeded: $0) })
-        req.referenceMaxPixels = Flux3KleinEnvelope.maxOutputPixels
+        req.referenceMaxPixels = Flux3KleinEnvelope.maxReferencePixels
         let result = try await generator.generate(req)
         try Task.checkCancellation()
         let png: Data
@@ -216,7 +219,7 @@ enum Flux3KleinServing {
                 IEditContract.descriptor(
                     name: "flux-3-klein",
                     summary: "FLUX 3 Image Klein editing and composition with up to 10 reference images. One reference "
-                        + "keeps its own size (fitted to the envelope); several are each fitted under 1 MP. Write the "
+                        + "keeps its own size, fitted under 2.77 MP (1664²); several are each fitted under 1 MP. Write the "
                         + "caption as a complete description of the result, the edit folded in. Refer to the n-th "
                         + "reference as 'the n-th image', or as <ref_image_n> in box edits. " + promptGuidance
                         + " FLUX KOMMUNITY LICENCE (see text-to-image).",

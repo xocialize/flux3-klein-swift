@@ -2,12 +2,12 @@
 //
 //   Flux3KleinGate --sched <goldensDir>
 //   Flux3KleinGate --prep <prepGoldensDir>
-//   Flux3KleinGate --e2e <snapshot> <oracleDir> <example.json>... [--mlx-noise]
+//   Flux3KleinGate --e2e <snapshot> <oracleDir> <example.json>... [--mlx-noise] [--untiled]
 //   Flux3KleinGate --oneshot <snapshot> <oracleDir> --dit bf16|int8|int4 --te bf16|int8 --case t2i|ref1|ref4|ref4mp
-//                  [--steps 2] [--drop-te] [--hold 6]   (footprint ledger: load, one request, hold for `footprint`)
+//                  [--steps 2] [--drop-te] [--hold 6] [--untiled]   (footprint ledger: load, one request, hold for `footprint`)
 //   Flux3KleinGate --package <snapshot> <oracleDir> [--quant int8] [--steps 16]   (the ModelPackage path: load, T2I and
 //                  a 1-ref edit through run(), PNGs to outputs/package/, and an envelope refusal)
-//   Flux3KleinGate --vae <snapshot> <goldensDir> [--gpu]
+//   Flux3KleinGate --vae <snapshot> <goldensDir> [--gpu]   (decode untiled and in row bands)
 //   Flux3KleinGate --encoder <snapshot> <goldensDir> [--gpu] [--bf16]
 //   Flux3KleinGate --dit <snapshot> <goldensDir> [--case t2i|ref1|ref3] [--gpu] [--quant int8|int4]
 //   Flux3KleinGate --encode-cache <snapshot> <prompts.json> <condDir> --te bf16|int8
@@ -132,7 +132,15 @@ func gateVAE(snapshot: URL, goldens: URL) throws {
     }
     let run = try MLX.loadArrays(url: goldens.appendingPathComponent("run_512.safetensors"))
     let latents = Flux3Latents.packed(fromTokens: run["latents.15"]!, height: 32, width: 32)
-    report("decode 512²", compare(decoder.decodePackedLatents(latents)[0], run["decoded"]!), cosGate: 0.99999, relGate: 5e-3)
+    let untiled = decoder.decodePackedLatents(latents)[0]
+    report("decode 512²", compare(untiled, run["decoded"]!), cosGate: 0.99999, relGate: 5e-3)
+    // The pipeline's default: row bands (.standard), and a small band so the 512² latent really splits.
+    for (label, tile) in [("standard", Flux2VAETile.standard), ("4 MB bands", Flux2VAETile(bandBytes: 4 << 20))] {
+        let tiled = decoder.decodePackedLatents(latents, tile: tile)[0]
+        report("decode 512² tiled \(label)", compare(tiled, run["decoded"]!), cosGate: 0.99999, relGate: 5e-3)
+        // Float reassociation in the band-wise GroupNorm stats and GEMM tiling: ~6e-5, 35× below the port vs the golden.
+        report("  tiled vs untiled", compare(tiled, untiled), cosGate: 0.9999999, relGate: 2e-4)
+    }
 }
 
 func psnr(_ a: Flux3RGBImage, _ b: Flux3RGBImage) -> Double {
@@ -176,7 +184,9 @@ func gateE2E(snapshot: URL, oracle: URL, examples: [URL]) async throws {
     let start = Date()
     let quant = arg("--quant").flatMap(Flux3Quant.init(rawValue:)) ?? .bf16
     let pipe = try await Flux3KleinPipeline.load(snapshot: snapshot, quant: quant)
-    print(String(format: "pipeline loaded (%@ DiT, bf16 TE, fp32 VAE) in %.1fs, MLX active %.2f GB", quant.rawValue,
+    if has("--untiled") { pipe.vaeTile = nil }
+    print(String(format: "pipeline loaded (%@ DiT, bf16 TE, fp32 VAE %@) in %.1fs, MLX active %.2f GB", quant.rawValue,
+                 pipe.vaeTile == nil ? "untiled" : "tiled",
                  Date().timeIntervalSince(start), Double(Memory.activeMemory) / 1e9))
     let outDir = URL(fileURLWithPath: "outputs/e2e")
     try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
@@ -194,7 +204,12 @@ func gateE2E(snapshot: URL, oracle: URL, examples: [URL]) async throws {
         let result = try pipe.generate(req, noise: noise)
         let secs = Date().timeIntervalSince(t0)
         let tag = (has("--mlx-noise") ? "mlxnoise" : "torchnoise") + (quant == .bf16 ? "" : "-\(quant.rawValue)")
-        try result.image.write(to: outDir.appendingPathComponent("\(name)__\(tag).png"))
+        let file = "\(name)__\(tag)\(has("--untiled") ? "-untiled" : "").png"
+        try result.image.write(to: outDir.appendingPathComponent(file))
+        let untiledPNG = outDir.appendingPathComponent("\(name)__\(tag)-untiled.png")
+        if !has("--untiled"), FileManager.default.fileExists(atPath: untiledPNG.path) {
+            print(String(format: "    tiled vs untiled render: %.2f dB", psnr(result.image, Flux3RGBImage(try Flux3PNG.read(url: untiledPNG)))))
+        }
         let bfl = Flux3RGBImage(try Flux3PNG.read(url: example.deletingPathExtension().appendingPathExtension("png")))
         let mps = quant == .bf16 ? oracle.appendingPathComponent("e2e/\(name)__a6.93.png")
             : outDir.appendingPathComponent("\(name)__torchnoise.png")  // quant tiers: vs our bf16 render
@@ -272,6 +287,7 @@ func oneshot(snapshot: URL, oracle: URL) async throws {
     var t0 = Date()
     let pipe = try await Flux3KleinPipeline.load(snapshot: snapshot, quant: dit, textEncoderQuant: te)
     eval(pipe.transformer)
+    if has("--untiled") { pipe.vaeTile = nil }
     let loadSecs = Date().timeIntervalSince(t0)
     let residentAll = Memory.activeMemory
     let inputs = oracle.appendingPathComponent("ref/examples/inputs")
@@ -343,8 +359,8 @@ func packageSmoke(snapshot: URL, oracle: URL) async throws {
     try edited.data.write(to: out.appendingPathComponent("edit-\(quant.rawValue).png"))
     print(String(format: "  PASS edit %dx%d in %.1fs", edited.width ?? 0, edited.height ?? 0, Date().timeIntervalSince(t0)))
     do {
-        _ = try await package.run(T2IRequest(prompt: "x", width: 2048, height: 2048, steps: 1))
-        failures += 1; print("  FAIL envelope: 2048² was not refused")
+        _ = try await package.run(T2IRequest(prompt: "x", width: 2064, height: 2048, steps: 1))
+        failures += 1; print("  FAIL envelope: 2064×2048 was not refused")
     } catch let error as Flux3KleinPackageError {
         print("  PASS envelope refusal: \(error.localizedDescription)")
     }

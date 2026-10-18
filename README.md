@@ -37,9 +37,9 @@ package is `MLXFlux3Klein` (below); its registration in Pixel Agency Image Engin
 | DiT (`Flux3Transformer`) | fp32 CPU: every stage on t2i, 1-ref and 3-ref at cos ≥ 0.9999998 (relMax ≤ 2.1e-5); the 16-step 512² trajectory at relMax ≤ 1.7e-4 |
 | Flow-map schedule | Exact. α = 6.93 from `config.json`; the reference CLI's 16.0 does not reproduce BFL's renders |
 | Conditioner (`Flux3TextEncoder`, Qwen3-VL-4B, 8 taps → 20480) | fp32 CPU: token ids exact; features cos ≥ 0.99998 on real and padded rows (the pad rows come from one masked pad token, broadcast) |
-| VAE (flux2-vae-mlx-swift ≥ 0.5.0, the same weights as FLUX.2) | Encoder tokens cos 0.999999; 512² decode cos 0.9999999 (GPU fp32) |
+| VAE (flux2-vae-mlx-swift ≥ 0.6.0, the same weights as FLUX.2) | Encoder tokens cos 0.999999; 512² decode cos 0.9999999 (GPU fp32), untiled and in row bands alike; row bands vs untiled relMax 5.8e-5 |
 | Reference prep (`Flux3References`) | Byte-identical to the reference on 5 cases: reflect pad, LANCZOS fit > 4 MiP, symmetric tiny pad, multi-ref resize + crop, multi-ref crop |
-| End to end, bf16 GPU (`--e2e`) | Replaying the reference's torch noise, PSNR against BFL's own example renders, the same level as BFL's own code on MPS (table below) |
+| End to end, bf16 GPU (`--e2e`) | Replaying the reference's torch noise, PSNR against BFL's own example renders, the same level as BFL's own code on MPS (table below). The row-band decode (v0.3.0 default) gives the same PSNR to 0.01 dB; tiled vs untiled renders 59.9–62.6 dB |
 
 | BFL example | Swift bf16 vs BFL | torch MPS oracle vs BFL | M5 Max, 16 steps |
 |---|---|---|---|
@@ -62,23 +62,42 @@ Prompting: the model wants a **full scene caption**. Run a prompt upsampler firs
   HF token whose account accepted the licence.
 - **Quant:** `quant` takes `.bf16`, `.int8` or `.int4`, made at load; `textEncoderQuant` sets the encoder tier.
 - **Memory path:** the encoder loads per request and is released before denoising, unless `keepEncoderResident` is set.
+  References are encoded one at a time; the VAE decodes in row bands (`Flux3KleinPipeline.vaeTile`, `.standard`; nil
+  decodes untiled).
 
 **Envelope** (refused, not clamped, in `run()`):
-- output area ≤ **1152²** (1.33 MP), sides multiples of 16, at least 64 px;
-- a single reference is fitted to the same area;
-- up to 10 references.
+- output area ≤ **2048²** (4.19 MP), sides multiples of 16, at least 64 px;
+- a single reference is fitted to **1664²** (2.77 MP), so an un-sized edit's output is at most that;
+- up to 10 references (each fitted under 1 MP by the model).
 
-**Footprints** (MLX pool, measured on the package path at the cap, 2 GB pool cap; `Flux3KleinFootprints`):
+**Footprints** (MLX pool, measured on the package path across the envelope, 2 GB pool cap; `Flux3KleinFootprints`,
+ledger `outputs/envelope-v030.log`, AB-R-0579):
 
-| DiT tier | Resident | Activation |
-|---|---|---|
-| bf16 | 11.7 GB | 15.5 GB (worst: 10 refs at 1152²) |
-| int8 | 6.7 GB | 15.5 GB |
-| int4 | 4.9 GB | 15.5 GB |
+| DiT tier | Resident | Activation | Declared total |
+|---|---|---|---|
+| bf16 | 11.7 GB | 12.0 GB (worst: a 1664² reference, 11.34 GB) | 23.7 GB |
+| int8 | 6.7 GB | 12.0 GB | 18.7 GB |
+| int4 | 4.9 GB | 12.0 GB | 16.9 GB, inside a 24 GB Mac's 19.07 GB budget |
 
-Most of the activation is the fp32 VAE decode, about 10.7 GB per output MP, which is why the cap sits at 1.33 MP.
-Tests: 11 offline (manifest licence posture, footprints, envelope, MAT, CAN-1/2/3, configuration). Live:
-`Flux3KleinGate --package` (load, T2I, edit, envelope refusal) passes at bf16 and int4.
+Activation above resident, bf16, v0.2.0 → v0.3.0 (GB):
+
+| Output | T2I | 1 reference (its own size) | 10 references (1024²) |
+|---|---|---|---|
+| 1024² | 11.27 → 2.34 | 11.27 → 4.29 | 14.81 → 8.11 |
+| 1152² | 14.23 → 2.76 | 14.23 → 5.43 | 14.86 → 8.31 |
+| 1536² | 25.28 → 4.38 | 25.28 → 9.66 | 9.03 |
+| 1440×1920 | 29.62 → 5.01 | 11.34 (1664²) | 9.31 |
+| 2048² | 45.02 → 7.21 | 18.66 (2048², outside) · 11.34 (1664²) | 10.32 |
+
+- **The decode** went from 10.7 to ~1.7 GB per output MP (row bands, flux2-vae-mlx-swift 0.6.0).
+- **Ten references** stacked their VAE encodes into the first DiT step until v0.3.0 evaluated each one as it is encoded.
+- **The largest term left** is the untiled fp32 VAE encode of a single reference, ~4.1 GB per reference MP. That is
+  why a single reference is capped below the output.
+- **phys_footprint peaks:** bf16 24.5 GB (1664² reference), int4 17.8 GB. Before: 28.2 / 21.4 GB at the 1152² cap.
+
+Tests: 13 offline (manifest licence posture, footprints and the target-Mac fit, envelope and its caps, MAT,
+CAN-1/2/3, configuration). Live: `Flux3KleinGate --package` (load, T2I, edit, envelope refusal) passes at bf16 and
+int4.
 
 ## Quant tiers (P3)
 
@@ -112,9 +131,10 @@ from bf16 under int4, against 31–50 dB under int8.
 | bf16 + int8 | 16.1 GB | 28.4 GB | — |
 | int8 + int8 | 11.1 GB | 23.5 GB | 18.8 GB |
 
-- About 11 GB of each 1024² peak is the fp32 VAE decode, the same in every tier.
-- 1 and 4 references at 1024² peak the same as T2I.
-- A single reference at the 4 MP cap (2048² canvas and output) peaks at 51–58 GB.
+- About 11 GB of each 1024² peak was the fp32 VAE decode, the same in every tier (v0.2.0; v0.3.0 decodes in row
+  bands, ~2.3 GB at 1024², see the package footprints above).
+- 1 and 4 references at 1024² peaked the same as T2I.
+- A single reference at the 4 MP cap (2048² canvas and output) peaked at 51–58 GB untiled.
 - Speed is the same in every tier: about 1 s per step for T2I, 2.3 s with one reference, 10 s with four, 20 s at the
   4 MP cap.
 
@@ -124,7 +144,7 @@ from bf16 under int4, against 31–50 dB under int8.
 swift build -c release --product Flux3KleinGate
 .build/release/Flux3KleinGate --sched <goldens>
 .build/release/Flux3KleinGate --encoder <snapshot> <goldens>    # conditioner, fp32 CPU
-.build/release/Flux3KleinGate --vae <snapshot> <goldens> --gpu  # encoder + decoder
+.build/release/Flux3KleinGate --vae <snapshot> <goldens> --gpu  # encoder + decoder, untiled and in row bands
 .build/release/Flux3KleinGate --prep <goldens>/prep             # reference prep, byte-exact
 .build/release/Flux3KleinGate --e2e <snapshot> <oracleDir> <example.json>...  # bf16 GPU vs BFL renders
 .build/release/Flux3KleinGate --dit <snapshot> <goldens>        # fp32 CPU; --gpu for the same math on the GPU
