@@ -66,7 +66,7 @@ struct OutputPresencePenalty: LogitProcessor {
     mutating func didSample(token: MLXArray) { seen.insert(token.asType(.int32).item(Int32.self)) }
 }
 
-public final class Flux3PromptUpsampler {
+public final class Flux3PromptUpsampler: Sendable {
     public let container: ModelContainer
     public let systemPrompts: [String: String]
     public let maxNewTokens: Int

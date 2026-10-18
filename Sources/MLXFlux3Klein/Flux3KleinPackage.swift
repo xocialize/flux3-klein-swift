@@ -30,6 +30,9 @@ public enum Flux3KleinPackageError: Error, LocalizedError {
     /// The request would run outside the envelope the declared footprint was MEASURED at, so the memory governor's
     /// reservation would under-state it. Refused rather than clamped: silently shrinking a size changes the output.
     case outsideMeasuredEnvelope(String)
+    /// A safety check flagged the prompt, a reference or the output (the reference's message). Only with
+    /// `safetyChecks` on.
+    case contentRefused(String)
 
     public var errorDescription: String? {
         switch self {
@@ -38,6 +41,7 @@ public enum Flux3KleinPackageError: Error, LocalizedError {
         case .pngEncode: return "PNG encoding failed."
         case .unsupportedQuant(let q): return "FLUX 3 Image Klein has no \(q) tier (bf16, int8 and int4 are declared)."
         case .outsideMeasuredEnvelope(let why): return why
+        case .contentRefused(let why): return "FLUX 3 Image Klein safety check refused the request: \(why)"
         }
     }
 }
@@ -117,7 +121,9 @@ public enum Flux3KleinMetaKeys {
 }
 
 /// The DiT and VAE stay resident. The prompt upsampler (when configured) and then the conditioner load per request and
-/// are released before denoising, unless `keepEncoderResident` is set.
+/// are released before denoising, unless `keepEncoderResident` is set. With the safety checks on, the NSFW classifier
+/// stays resident and the yes/no judge loads per screening pass: the upsampler when one is configured (the input pass
+/// hands it on to the caption), else Qwen3-VL-4B from the snapshot's text encoder.
 @InferenceActor
 final class Flux3KleinGenerator {
     let pipeline: Flux3KleinPipeline
@@ -125,18 +131,21 @@ final class Flux3KleinGenerator {
     let keepEncoderResident: Bool
     let textEncoderQuant: Flux3TextEncoderQuant
     let upsamplerDirectory: URL?
+    let safetyClassifier: Flux3NSFWClassifier?
     private var residentEncoder: Flux3TextEncoder?
 
     init(pipeline: Flux3KleinPipeline, snapshot: URL, keepEncoderResident: Bool, textEncoderQuant: Flux3TextEncoderQuant,
-         upsamplerDirectory: URL?) {
+         upsamplerDirectory: URL?, safetyClassifier: Flux3NSFWClassifier? = nil) {
         self.pipeline = pipeline
         self.snapshot = snapshot
         self.keepEncoderResident = keepEncoderResident
         self.textEncoderQuant = textEncoderQuant
         self.upsamplerDirectory = upsamplerDirectory
+        self.safetyClassifier = safetyClassifier
     }
 
-    static func load(configuration c: Flux3KleinConfiguration, snapshot: URL, upsampler: URL?) throws -> Flux3KleinGenerator {
+    static func load(configuration c: Flux3KleinConfiguration, snapshot: URL, upsampler: URL?,
+                     safety: URL? = nil) throws -> Flux3KleinGenerator {
         let quant: Flux3Quant
         switch c.quant {
         case .bf16: quant = .bf16
@@ -151,8 +160,67 @@ final class Flux3KleinGenerator {
         MLX.Memory.clearCache()
         let pipeline = Flux3KleinPipeline(transformer: transformer, textEncoder: nil, vaeEncoder: vaeEncoder, vae: vae,
                                           snapshot: snapshot)
+        let classifier = try safety.map { try Flux3NSFWClassifier.load(directory: $0) }
         return Flux3KleinGenerator(pipeline: pipeline, snapshot: snapshot, keepEncoderResident: c.keepEncoderResident,
-                                   textEncoderQuant: c.textEncoderQuant, upsamplerDirectory: upsampler)
+                                   textEncoderQuant: c.textEncoderQuant, upsamplerDirectory: upsampler,
+                                   safetyClassifier: classifier)
+    }
+
+    // MARK: Safety checks (the reference's `generate.generate` with `safety=True`)
+
+    /// The judge for one screening pass, created in the caller's scope: the upsampler when one is configured (the
+    /// reference checks on it whenever it is loaded, even for a request that skips upsampling), else Qwen3-VL-4B-Instruct
+    /// from the snapshot's `text_encoder/`, as a VLM.
+    private func loadJudge() async throws -> (Flux3SafetyJudge, Flux3PromptUpsampler?) {
+        if let dir = upsamplerDirectory {
+            let upsampler = try await Flux3PromptUpsampler.load(directory: dir)
+            return (try await Flux3SafetyJudge(upsampler: upsampler), upsampler)
+        }
+        let judge = try await Flux3SafetyJudge.load(textEncoderDirectory: snapshot.appendingPathComponent("text_encoder"))
+        return (judge, nil)
+    }
+
+    /// The input checks: the prompt with every box description, then each reference as given. Returns the upsampler it
+    /// loaded as the judge, for the caption to reuse; nil (and no work) with the checks off.
+    func screenInputs(prompt: String, boxes: [Flux3Box]?, references: [Flux3RGBImage]) async throws -> Flux3PromptUpsampler? {
+        guard let classifier = safetyClassifier else { return nil }
+        RunProgress.report(.screen)
+        let (judge, upsampler) = try await loadJudge()
+        let checker = Flux3SafetyChecker(classifier: classifier, judge: judge)
+        if try await checker.checkPrompt(Flux3SafetyPrompts.screened(prompt, boxes: boxes)).flagged {
+            throw Flux3KleinPackageError.contentRefused(
+                "The prompt may name a copyrighted character, a brand or a public figure.")
+        }
+        for (i, image) in references.enumerated() {
+            try Task.checkCancellation()
+            if let reason = try await checker.checkImage(image).reason {
+                throw Flux3KleinPackageError.contentRefused("Reference image \(i + 1) may show \(reason).")
+            }
+        }
+        return upsampler
+    }
+
+    /// The input checks, then the caption, in one scope: an upsampler loaded as the judge is reused for the caption and
+    /// released when this returns, before the encoder and the denoise loop.
+    func screenedCaption(for prompt: String, originals: [Flux3RGBAImage], references: [Flux3RGBImage], boxes: [Flux3Box]?,
+                         upsample: Bool) async throws -> String {
+        let judge = try await screenInputs(prompt: prompt, boxes: boxes, references: references)
+        let caption = try await caption(for: prompt, references: originals, boxes: boxes, upsample: upsample, loaded: judge)
+        MLX.Memory.clearCache()
+        return caption
+    }
+
+    /// The output check: the classifier first; the judge loads only when the classifier passes the image.
+    func screenOutput(_ image: Flux3RGBImage) async throws {
+        guard let classifier = safetyClassifier else { return }
+        RunProgress.report(.screen)
+        func refuse(_ reason: String) -> Flux3KleinPackageError {
+            .contentRefused("The generated image may show \(reason), so it was not returned. Try another prompt or seed.")
+        }
+        if classifier.nsfwScore(image) > Flux3NSFWClassifier.threshold { throw refuse(Flux3SafetyChecker.nsfwReason) }
+        let flagged = try await loadJudge().0.imageMargin(image) > 0
+        MLX.Memory.clearCache()
+        if flagged { throw refuse(Flux3SafetyChecker.promptReason) }
     }
 
     /// The prompt's conditioning. A per-request encoder is created and dropped inside this scope, so it never lives
@@ -174,12 +242,15 @@ final class Flux3KleinGenerator {
     /// The caption the image model gets, as the reference's `generate.generate` builds it: a finished caption (box
     /// table cited in full) goes as it is; otherwise the upsampler writes it (boxes reconciled); without one, boxes are
     /// appended to the prompt on the 0–1000 canvas.
-    func caption(for prompt: String, references: [Flux3RGBAImage], boxes: [Flux3Box]?, upsample: Bool) async throws -> String {
+    func caption(for prompt: String, references: [Flux3RGBAImage], boxes: [Flux3Box]?, upsample: Bool,
+                 loaded: Flux3PromptUpsampler? = nil) async throws -> String {
         let finished = (boxes?.isEmpty ?? true) && Flux3Boxes.isFinished(prompt)
         if upsample, !finished, let dir = upsamplerDirectory {
-            // Loaded and dropped inside this scope, so it never lives into the encoder or the denoise loop.
-            let caption = try await Flux3PromptUpsampler.load(directory: dir)
-                .upsample(prompt, references: references, boxes: boxes)
+            // Loaded (or handed on by the input checks) and dropped inside this scope, so it never lives into the
+            // encoder or the denoise loop.
+            let upsampler: Flux3PromptUpsampler
+            if let loaded { upsampler = loaded } else { upsampler = try await Flux3PromptUpsampler.load(directory: dir) }
+            let caption = try await upsampler.upsample(prompt, references: references, boxes: boxes)
             MLX.Memory.clearCache()
             return caption
         }
@@ -215,7 +286,13 @@ enum Flux3KleinServing {
             else { throw Flux3KleinPackageError.unreadableSnapshot(c.upsamplerPath.isEmpty ? c.upsampler.repo ?? "" : c.upsamplerPath) }
             upsampler = dir
         }
-        return try Flux3KleinGenerator.load(configuration: c, snapshot: snapshot, upsampler: upsampler)
+        var safety: URL? = nil
+        if c.safetyChecks {
+            guard let dir = c.resolvedSafetyDirectory(storeRoot: c.modelsRootDirectory), Flux3KleinConfiguration.safetyComplete(dir)
+            else { throw Flux3KleinPackageError.unreadableSnapshot(c.safetyClassifierPath.isEmpty ? Flux3KleinConfiguration.safetyRepo : c.safetyClassifierPath) }
+            safety = dir
+        }
+        return try Flux3KleinGenerator.load(configuration: c, snapshot: snapshot, upsampler: upsampler, safety: safety)
     }
 
     static func run(_ request: any CapabilityRequest, generator: Flux3KleinGenerator,
@@ -249,7 +326,8 @@ enum Flux3KleinServing {
         let boxes = try Flux3KleinMetaKeys.boxes(meta)
         let upsample = try Flux3KleinMetaKeys.upsample(meta) ?? true
         try Task.checkCancellation()
-        let caption = try await generator.caption(for: prompt, references: originals, boxes: boxes, upsample: upsample)
+        let caption = try await generator.screenedCaption(for: prompt, originals: originals, references: references,
+                                                          boxes: boxes, upsample: upsample)
         try Task.checkCancellation()  // post-upsample seam
         var req = Flux3KleinPipeline.Request(
             prompt: caption, references: references, width: width, height: height, steps: steps ?? c.defaultSteps,
@@ -257,6 +335,7 @@ enum Flux3KleinServing {
         req.referenceMaxPixels = Flux3KleinEnvelope.maxReferencePixels
         let result = try await generator.generate(req)
         try Task.checkCancellation()
+        try await generator.screenOutput(result.image)
         let png: Data
         do { png = try Flux3PNG.pngData(result.image.rgba()) } catch { throw Flux3KleinPackageError.pngEncode }
         let artifact = Image(format: .png, data: png, width: result.width, height: result.height)

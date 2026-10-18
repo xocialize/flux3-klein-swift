@@ -9,6 +9,7 @@ import XCTest
 
 final class Flux3KleinPackageTests: XCTestCase {
     static let weights = "/Volumes/Satechi/Development/mlxengine-image/weights/flux-3-image-klein"
+    static let classifier = "/Volumes/Satechi/Development/mlxengine-image/weights/nsfw-classifier"
 
     /// C7: the FLUX Kommunity License, package-local and NOT allowlisted (AB-D-0151); C8: MIT.
     func testManifestIsKommunityAndNotPermissive() {
@@ -94,6 +95,44 @@ final class Flux3KleinPackageTests: XCTestCase {
         XCTAssertNil(Flux3KleinConfiguration(upsampler: .int4).peakActivationBytesHint)
         XCTAssertGreaterThan(Flux3KleinConfiguration(upsampler: .bf16).peakActivationBytesHint!,
                              Flux3KleinFootprints.declared.map(\.peakActivationBytes).max()!)
+    }
+
+    /// BFL's safety checks are off by default (as upstream); on, they add the pinned NSFW classifier as a weight source
+    /// and its 0.35 GB to the resident term.
+    func testSafetyChecksOffByDefault() throws {
+        let off = Flux3KleinConfiguration()
+        XCTAssertFalse(off.safetyChecks)
+        XCTAssertFalse(off.weightSources.contains { $0.role == "safety" })
+        XCTAssertNil(off.resolvedSafetyDirectory(storeRoot: nil))
+        let on = Flux3KleinConfiguration(safetyChecks: true)
+        let source = try XCTUnwrap(on.weightSources.last)
+        XCTAssertEqual(source.role, "safety")
+        XCTAssertEqual(source.repo, "Falconsai/nsfw_image_detection")
+        XCTAssertEqual(source.revision?.count, 40)
+        XCTAssertTrue(source.matching?.contains("model.safetensors") ?? false)
+        let bf16 = Flux3KleinFootprints.declared.first { $0.quant == .bf16 }!.residentBytes
+        XCTAssertEqual(on.residentBytesHint, bf16 + Flux3KleinFootprints.safetyClassifierBytes)
+        let old = try JSONDecoder().decode(Flux3KleinConfiguration.self, from: Data(#"{"quant":"bf16"}"#.utf8))
+        XCTAssertFalse(old.safetyChecks, "configurations saved before P6 keep the checks off")
+        let back = try JSONDecoder().decode(Flux3KleinConfiguration.self, from: JSONEncoder().encode(on))
+        XCTAssertTrue(back.safetyChecks)
+    }
+
+    func testMATGateWithSafety() {
+        let haveLocal = FileManager.default.fileExists(atPath: Self.weights + "/model.safetensors")
+            && FileManager.default.fileExists(atPath: Self.classifier + "/model.safetensors")
+        let report = MaterializationConformance.check(
+            freshConfiguration: Flux3KleinConfiguration(safetyChecks: true),
+            satisfiedConfiguration: haveLocal
+                ? Flux3KleinConfiguration(snapshotPath: Self.weights, upsamplerPath: Self.weights + "-pup",
+                                          safetyChecks: true, safetyClassifierPath: Self.classifier) : nil)
+        XCTAssertTrue(report.passed, report.summary)
+    }
+
+    func testRefusalMessage() {
+        let e = Flux3KleinPackageError.contentRefused("Reference image 2 may show nudity or other adult content.")
+        XCTAssertEqual(e.errorDescription,
+                       "FLUX 3 Image Klein safety check refused the request: Reference image 2 may show nudity or other adult content.")
     }
 
     func testMetaDataLevers() throws {

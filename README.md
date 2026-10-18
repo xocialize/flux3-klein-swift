@@ -133,9 +133,54 @@ Activation above resident, bf16, v0.2.0 → v0.3.0 → v0.4.0 (GB):
 - **phys_footprint peaks:** bf16 22.8 GB (10 refs into 2048²), 20.0 GB (a 2048² reference), int4 16.0 GB. v0.3.0:
   24.5 / 17.8 GB with the 1664² cap; before that 28.2 / 21.4 GB at the 1152² cap.
 
-Tests: 13 offline (manifest licence posture, footprints and the target-Mac fit, envelope and its caps, MAT,
+Tests: 18 offline (manifest licence posture, the safety switch, its weight source and refusal message, footprints and the target-Mac fit, envelope and its caps, MAT,
 CAN-1/2/3, configuration). Live: `Flux3KleinGate --package` (load, T2I, edit, envelope refusal) passes at bf16 and
 int4.
+
+## Safety checks (P6, off by default)
+
+A port of BFL's `flux3/safety.py` and its use in `generate.py`. It is **off by default**, as upstream ships it and as
+Mage-Flow's filter is in our runtime (AB-D-0122). `Flux3KleinConfiguration.safetyChecks` turns it on; the runtime's
+switch is `MLXIMG_FLUX3_SAFETY=1`. With it on:
+- **Prompt check:** the request plus every box description is asked BFL's yes/no question: does it name a copyrighted
+  character, a brand or a living public figure?
+- **Image check** (each reference as given, then the output):
+  - first the NSFW classifier, [Falconsai/nsfw_image_detection](https://huggingface.co/Falconsai/nsfw_image_detection)
+    (Apache-2.0 ViT-B/16, `Flux3NSFWClassifier`), flagging P(nsfw) > 0.85;
+  - then the image, resized to ~512² area, gets the yes/no question about characters, brands and public figures.
+- **Judge:** the yes/no is the next-token logit of "yes" against "no". It runs on the prompt upsampler when one is
+  configured, the reference's own choice, otherwise on Qwen3-VL-4B-Instruct loaded as a VLM from the snapshot's
+  `text_encoder/`.
+- **A flag fails the job** with the reference's message (`Flux3KleinPackageError.contentRefused`) and reports the
+  `screen` run phase.
+
+Memory: the classifier stays resident (0.35 GB, added to the resident hint). The judge loads per screening pass. The
+input pass hands its upsampler on to the caption, so it loads once; the output pass loads it again after the decode.
+
+**Gate** (`mlxengine-image/WIP/flux3-klein-safety-gate`: 99 prompts, 123 images, BFL's own code as the reference):
+
+| | Upsampler judge (int8, the default) | Qwen3-VL-4B judge (upsampler off) |
+|---|---|---|
+| Parity with BFL's code | prompts 99/99 verdicts (margins within 0.125), images 122/123 (the miss at ±0.25) | prompts 99/99 (within 1.0), images 122/123 (the miss at −0.25 / +0.75) |
+| Benign prompts flagged | 0/45 | 0/45 |
+| Near-miss prompts flagged (archetypes, styles, invented brands) | 1/30 | 0/30 |
+| Named characters, brands, public figures caught (prompt) | 23/24 | **5/24**, as in BFL's code |
+| Benign images flagged | 6/91 (mostly defensible: a Joy-Con, a bust, a fencer, a Qantas jet) | 4/91 |
+| Character, brand and celebrity renders caught | 12/12 | 12/12 |
+| NSFW classifier on benign and risky images (swimwear, statues, ballet…) | 0/123 (max P 0.59 vs 0.85) | same |
+| Per check | prompt 110 ms, image 263 ms + 11 ms | prompt 53 ms, image 134 ms + 13 ms |
+
+**Package path** (`Flux3KleinGate --package-safety`, bf16, M5 Max):
+
+| Judge | Benign 1024² request | Named character | Benign 1-ref edit | Activation |
+|---|---|---|---|---|
+| Upsampler int8 | 25.8 s (23.8 s without the checks) | refused at the prompt check in 0.9 s | 47.2 s (≈45 s without) | 11.72 GB, unchanged |
+| Qwen3-VL-4B | 18.0 s | rendered, then refused at the output check (18.0 s) | 38.7 s | 9.90 GB |
+
+So the checks add about 2 s per job and no memory over the declaration. They don't refuse ordinary requests. They do
+refuse anything that names, or renders recognisably as, a character, a brand or a real person, including photos of
+real products and people used as references. With the upsampler off, the prompt check catches few names; the output
+check catches most of them after the render.
 
 ## Quant tiers (P3)
 

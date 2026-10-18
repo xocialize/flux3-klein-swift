@@ -21,10 +21,37 @@ public struct Flux3RGBAImage: Sendable {
     }
 }
 
-// MARK: - PIL-exact LANCZOS (4 bands, premultiplied round trip)
+// MARK: - PIL-exact resampling (LANCZOS, BICUBIC, BILINEAR; RGBA as a premultiplied round trip)
 
 public enum Flux3PILResize {
     static let precisionBits = 32 - 8 - 2
+
+    /// PIL's antialiased resampling filters (`Resampling.LANCZOS` / `BICUBIC` / `BILINEAR`).
+    public enum Filter: Sendable {
+        case lanczos, bicubic, bilinear
+
+        var support: Double {
+            switch self {
+            case .lanczos: 3
+            case .bicubic: 2
+            case .bilinear: 1
+            }
+        }
+
+        func weight(_ xIn: Double) -> Double {
+            let x = abs(xIn)
+            switch self {
+            case .lanczos: return Flux3PILResize.lanczos(x)
+            case .bilinear: return x < 1 ? 1 - x : 0
+            case .bicubic:
+                // PIL's bicubic, a = -0.5.
+                let a = -0.5
+                if x < 1 { return ((a + 2) * x - (a + 3)) * x * x + 1 }
+                if x < 2 { return (((x - 5) * x + 8) * x - 4) * a }
+                return 0
+            }
+        }
+    }
 
     static func sinc(_ x: Double) -> Double {
         if x == 0 { return 1 }
@@ -37,10 +64,10 @@ public enum Flux3PILResize {
         return x < 3 ? sinc(x) * sinc(x / 3) : 0
     }
 
-    static func coefficients(inSize: Int, outSize: Int) -> (bounds: [(min: Int, count: Int)], coeffs: [[Int32]]) {
+    static func coefficients(inSize: Int, outSize: Int, filter: Filter = .lanczos) -> (bounds: [(min: Int, count: Int)], coeffs: [[Int32]]) {
         let scale = Double(inSize) / Double(outSize)
         let filterscale = max(scale, 1.0)
-        let support = 3.0 * filterscale
+        let support = filter.support * filterscale
         let one = Double(1 << precisionBits)
         var bounds: [(Int, Int)] = []
         var coeffs: [[Int32]] = []
@@ -54,7 +81,7 @@ public enum Flux3PILResize {
             var w = [Double](repeating: 0, count: count)
             var total = 0.0
             for x in 0..<count {
-                let v = lanczos((Double(x + xmin) - center + 0.5) / filterscale)
+                let v = filter.weight((Double(x + xmin) - center + 0.5) / filterscale)
                 w[x] = v
                 total += v
             }
@@ -80,9 +107,10 @@ public enum Flux3PILResize {
     }
 
     /// Resample `bands` interleaved 8-bit channels (no alpha handling).
-    public static func resampleBands(_ src: [UInt8], bands: Int, width: Int, height: Int, outWidth: Int, outHeight: Int) -> [UInt8] {
+    public static func resampleBands(_ src: [UInt8], bands: Int, width: Int, height: Int, outWidth: Int, outHeight: Int,
+                                     filter: Filter = .lanczos) -> [UInt8] {
         let half = Int32(1 << (precisionBits - 1))
-        let (hB, hC) = coefficients(inSize: width, outSize: outWidth)
+        let (hB, hC) = coefficients(inSize: width, outSize: outWidth, filter: filter)
         var temp = [UInt8](repeating: 0, count: height * outWidth * bands)
         src.withUnsafeBufferPointer { s in
             temp.withUnsafeMutableBufferPointer { d in
@@ -101,7 +129,7 @@ public enum Flux3PILResize {
                 }
             }
         }
-        let (vB, vC) = coefficients(inSize: height, outSize: outHeight)
+        let (vB, vC) = coefficients(inSize: height, outSize: outHeight, filter: filter)
         var out = [UInt8](repeating: 0, count: outHeight * outWidth * bands)
         temp.withUnsafeBufferPointer { s in
             out.withUnsafeMutableBufferPointer { d in

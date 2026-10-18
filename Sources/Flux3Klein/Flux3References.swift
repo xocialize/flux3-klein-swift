@@ -95,9 +95,10 @@ enum Flux3Orientation {
 extension Flux3RGBImage {
 
     /// PIL `resize((w, h), LANCZOS)`.
-    public func resized(width w: Int, height h: Int) -> Flux3RGBImage {
+    public func resized(width w: Int, height h: Int, filter: Flux3PILResize.Filter = .lanczos) -> Flux3RGBImage {
         if w == width && h == height { return self }
-        let out = Flux3PILResize.resampleBands(rgb, bands: 3, width: width, height: height, outWidth: w, outHeight: h)
+        let out = Flux3PILResize.resampleBands(rgb, bands: 3, width: width, height: height, outWidth: w, outHeight: h,
+                                               filter: filter)
         return Flux3RGBImage(rgb: out, width: w, height: h)
     }
 

@@ -1,6 +1,6 @@
 # flux3-klein-swift — Porting spec: FLUX 3 Image Klein → Swift/MLX
 
-Status: **P0–P5 done 2026-10-18** (served by Pixel Agency Image Engine 0.2.12, named-only). The engine-free pipeline is gated end to end; quant tiers have passed the OCR gate,
+Status: **P0–P6 done 2026-10-18** (P6 = the safety checks, off by default) (served by Pixel Agency Image Engine 0.2.12, named-only). The engine-free pipeline is gated end to end; quant tiers have passed the OCR gate,
 footprints are measured, and the weights are on mlx-community. P5 (engine package) comes next (the spec was written the same day, four days after release). It is a
 **restricted, named-only tier for the Pixel Agency Image Engine** (`pixel-agency-image-engine`, with its MES HTTP and MCP
 bindings), not a product
@@ -309,10 +309,15 @@ it is ≈ 13 GB, before the upsampler.
   prompt that expands the request". That leaves the 18.8 GB upsampler as an engine-side option, not a
   requirement.
 
-**P6 — safety (the §2(e) condition, if anyone uses the commercial exception)**
-- An opt-in output filter: the NSFW classifier, plus the prompt check through the already-loaded TE.
-- EXIF/XMP AI-provenance tags, as `safety.py` writes them.
-- Default on whenever the offer is used outside research.
+**P6 — safety (the §2(e) condition, if anyone uses the commercial exception)** — DONE 2026-10-18 (v0.6.0)
+- `safety.py` + `generate.py`'s use of it are ported (`Flux3NSFWClassifier`, `Flux3SafetyJudge`, `Flux3SafetyChecker`):
+  the prompt, each reference and the output; the judge is the upsampler when configured, else Qwen3-VL-4B as a VLM.
+  `Flux3KleinConfiguration.safetyChecks`, runtime `MLXIMG_FLUX3_SAFETY=1`.
+- **Off by default** (operator 2026-10-18, as Mage-Flow's filter, AB-D-0122): to be tested for intrusiveness before
+  any default changes. Gate: `mlxengine-image/WIP/flux3-klein-safety-gate` (parity 99/99 prompts, 122/123 images
+  on both judges; intrusiveness table there).
+- Deferred: EXIF provenance tags (`exif()` in `safety.py`). They belong with the operator's later output-usage
+  features, which disclose and do not enforce (AB-D-0151, 2026-10-18).
 
 **P7 (optional) — Base checkpoint**
 - 50 steps, CFG 4.0 (the code) / 3.5 (the card) on a two-sample pack. It is the parity reference for

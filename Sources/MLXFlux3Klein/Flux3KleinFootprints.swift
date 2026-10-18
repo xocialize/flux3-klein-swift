@@ -57,6 +57,9 @@ enum Flux3KleinFootprints {
     /// int8 (11.06 GB) and int4 (6.79 GB) stay under the declared activation.
     static let bf16UpsamplerPeakActivationBytes: UInt64 = 20_900_000_000
 
+    /// The safety checks' NSFW classifier (ViT-B/16, fp32 safetensors 343.2 MB), resident while the checks are on.
+    static let safetyClassifierBytes: UInt64 = 350_000_000
+
     static func encoderBytes(_ quant: Flux3TextEncoderQuant) -> UInt64 {
         quant == .int8 ? 4_900_000_000 : 8_300_000_000
     }
