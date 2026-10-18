@@ -1,6 +1,6 @@
 # flux3-klein-swift — Porting spec: FLUX 3 Image Klein → Swift/MLX
 
-Status: **P0–P3 done 2026-10-17.** The engine-free pipeline is gated end to end; quant tiers have passed the OCR gate,
+Status: **P0–P3 and P5 done 2026-10-17** (served by Pixel Agency Image Engine 0.2.12, named-only). The engine-free pipeline is gated end to end; quant tiers have passed the OCR gate,
 footprints are measured, and the weights are on mlx-community. P5 (engine package) comes next (the spec was written the same day, four days after release). It is a
 **restricted, named-only tier for the Pixel Agency Image Engine** (`pixel-agency-image-engine`, with its MES HTTP and MCP
 bindings), not a product
@@ -240,7 +240,18 @@ it is ≈ 13 GB, before the upsampler.
 - Footprints declared from the package-path ledger: resident bf16 11.7 / int8 6.7 / int4 4.9 GB, activation
   15.5 GB.
 - 11 offline tests (MAT, CAN, manifest) pass; the live `--package` smoke passes at bf16 and int4.
-- P5b, registration in mlx-image-runtime and the engine, follows.
+- **P5b done:**
+  - mlx-image-runtime 0.9.0: `flux-3-klein` entry, restricted, `.wip`, DiT tier by Mac (bf16 ≥ 48 GB, int8 ≥ 32 GB,
+    int4 below; `MLXIMG_FLUX3_QUANT`).
+  - Pixel Agency Image Engine 0.2.12: offered with `--allow-research`, named-only on image.generate / image.edit,
+    with a Kommunity licence notice.
+  - In-app (`WIP/flux3-klein-inapp`):
+    - first download from the gated mirror works;
+    - bf16 phys peak 22 GB (declared 27.2), int8 17 GB (declared 22.2);
+    - a commercial-only request is refused `policy_unmet`;
+    - conformance 35/0 warm.
+  - Open: per-model prompting notes in MES (ask AB-A-0186 to mlx-apps); the tiled VAE decode (flux2-vae 0.6.0) to
+    widen the envelope.
 
 **P4 — upsampler**
 - Convert the upsampler (Qwen3.5-9B VL) to MLX int4/int8 and run it through `MLXVLM`, using
