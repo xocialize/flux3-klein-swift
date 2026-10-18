@@ -62,38 +62,40 @@ Prompting: the model wants a **full scene caption**. Run a prompt upsampler firs
   HF token whose account accepted the licence.
 - **Quant:** `quant` takes `.bf16`, `.int8` or `.int4`, made at load; `textEncoderQuant` sets the encoder tier.
 - **Memory path:** the encoder loads per request and is released before denoising, unless `keepEncoderResident` is set.
-  References are encoded one at a time; the VAE decodes in row bands (`Flux3KleinPipeline.vaeTile`, `.standard`; nil
-  decodes untiled).
+  References are encoded one at a time; the VAE encodes and decodes in row bands (`Flux3KleinPipeline.vaeTile`,
+  `.standard`; nil runs both untiled).
 
 **Envelope** (refused, not clamped, in `run()`):
 - output area ≤ **2048²** (4.19 MP), sides multiples of 16, at least 64 px;
-- a single reference is fitted to **1664²** (2.77 MP), so an un-sized edit's output is at most that;
+- a single reference is fitted to **2048²** (4 MiP, the reference's own cap), so an un-sized edit's output is at most that;
 - up to 10 references (each fitted under 1 MP by the model).
 
 **Footprints** (MLX pool, measured on the package path across the envelope, 2 GB pool cap; `Flux3KleinFootprints`,
-ledger `outputs/envelope-v030.log`, AB-R-0579):
+ledgers `outputs/envelope-v030.log` + `envelope-v040.log`, AB-R-0579, AB-R-0580):
 
 | DiT tier | Resident | Activation | Declared total |
 |---|---|---|---|
-| bf16 | 11.7 GB | 12.0 GB (worst: a 1664² reference, 11.34 GB) | 23.7 GB |
+| bf16 | 11.7 GB | 12.0 GB (worst: 10 references into 2048², 10.32 GB) | 23.7 GB |
 | int8 | 6.7 GB | 12.0 GB | 18.7 GB |
 | int4 | 4.9 GB | 12.0 GB | 16.9 GB, inside a 24 GB Mac's 19.07 GB budget |
 
-Activation above resident, bf16, v0.2.0 → v0.3.0 (GB):
+Activation above resident, bf16, v0.2.0 → v0.3.0 → v0.4.0 (GB):
 
 | Output | T2I | 1 reference (its own size) | 10 references (1024²) |
 |---|---|---|---|
-| 1024² | 11.27 → 2.34 | 11.27 → 4.29 | 14.81 → 8.11 |
-| 1152² | 14.23 → 2.76 | 14.23 → 5.43 | 14.86 → 8.31 |
-| 1536² | 25.28 → 4.38 | 25.28 → 9.66 | 9.03 |
-| 1440×1920 | 29.62 → 5.01 | 11.34 (1664²) | 9.31 |
-| 2048² | 45.02 → 7.21 | 18.66 (2048², outside) · 11.34 (1664²) | 10.32 |
+| 1024² | 11.27 → 2.34 | 11.27 → 4.29 → 2.35 | 14.81 → 8.11 |
+| 1152² | 14.23 → 2.76 | 14.23 → 5.43 → 2.77 | 14.86 → 8.31 |
+| 1536² | 25.28 → 4.38 | 25.28 → 9.66 → 4.38 | 9.03 |
+| 1440×1920 | 29.62 → 5.01 | 11.34 → 5.01 (1664²) | 9.31 |
+| 2048² | 45.02 → 7.21 | 18.66 → 7.22 (2048²) | 10.32 |
 
 - **The decode** went from 10.7 to ~1.7 GB per output MP (row bands, flux2-vae-mlx-swift 0.6.0).
 - **Ten references** stacked their VAE encodes into the first DiT step until v0.3.0 evaluated each one as it is encoded.
-- **The largest term left** is the untiled fp32 VAE encode of a single reference, ~4.1 GB per reference MP. That is
-  why a single reference is capped below the output.
-- **phys_footprint peaks:** bf16 24.5 GB (1664² reference), int4 17.8 GB. Before: 28.2 / 21.4 GB at the 1152² cap.
+- **The reference encode** went from ~4.1 GB per reference MP to the output's cost in v0.4.0 (row bands,
+  flux2-vae-mlx-swift 0.7.0). A single reference now follows the reference's own 2048² cap; a 2048² reference into a
+  1024² output is 4.62 GB.
+- **phys_footprint peaks:** bf16 22.8 GB (10 refs into 2048²), 20.0 GB (a 2048² reference), int4 16.0 GB. v0.3.0:
+  24.5 / 17.8 GB with the 1664² cap; before that 28.2 / 21.4 GB at the 1152² cap.
 
 Tests: 13 offline (manifest licence posture, footprints and the target-Mac fit, envelope and its caps, MAT,
 CAN-1/2/3, configuration). Live: `Flux3KleinGate --package` (load, T2I, edit, envelope refusal) passes at bf16 and

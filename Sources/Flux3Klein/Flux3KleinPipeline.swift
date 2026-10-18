@@ -4,8 +4,9 @@
 //
 // Precision follows the reference under CUDA autocast: the DiT runs in bf16 with bf16 text features, bf16 reference
 // tokens and bf16-rounded timesteps; the image tokens stay fp32 across the Euler steps (bf16-rounded noise); the VAE
-// runs in fp32, in row bands by default (flux2-vae-mlx-swift 0.6.0, AB-R-0577): the same image as the untiled decode
-// to float reassociation, at a fraction of its peak (10.7 → 2.4 GB at 1024²).
+// runs in fp32, in row bands by default for the decode (flux2-vae-mlx-swift 0.6.0, AB-R-0577) and the reference
+// encode (0.7.0): the same result as untiled to float reassociation, at a fraction of its peak (decode 10.7 → 2.4 GB
+// at 1024²).
 
 import CryptoKit
 import Flux2VAE
@@ -19,7 +20,8 @@ public final class Flux3KleinPipeline {
     public let vaeEncoder: Flux2VAEEncoder
     public let vae: Flux2VAE
     public let snapshot: URL
-    /// Row-band size for the fp32 VAE decode; nil decodes the whole latent at once (about 4× the peak).
+    /// Row-band size for the fp32 VAE decode and reference encode; nil runs each untiled (the decode at about 4× the
+    /// peak; a single reference's encode at ~4.1 GB per MP).
     public var vaeTile: Flux2VAETile? = .standard
 
     public init(transformer: Flux3Transformer, textEncoder: Flux3TextEncoder?, vaeEncoder: Flux2VAEEncoder,
@@ -130,7 +132,8 @@ public final class Flux3KleinPipeline {
         var condTokens: [MLXArray] = []
         var condIDs: [MLXArray] = []
         for (n, reference) in references.enumerated() {
-            let packed = vaeEncoder.encodePacked(reference.pixelsNCHW())
+            let pixels = reference.pixelsNCHW()
+            let packed = vaeTile.map { vaeEncoder.encodePacked(pixels, tile: $0) } ?? vaeEncoder.encodePacked(pixels)
             condTokens.append(Flux3Latents.tokens(fromPacked: packed).asType(dtype))
             eval(condTokens[n])  // one encoder transient at a time, never stacked into the first DiT step
             condIDs.append(Flux3Latents.ids(height: packed.dim(2), width: packed.dim(3), l: -Float(1 + n)))

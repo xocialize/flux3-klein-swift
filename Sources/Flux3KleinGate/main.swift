@@ -124,11 +124,22 @@ func gateVAE(snapshot: URL, goldens: URL) throws {
     for name in ["ref1", "ref3"] {
         let g = try MLX.loadArrays(url: goldens.appendingPathComponent("dit_\(name).safetensors"))
         let j = try loadJSON(goldens.appendingPathComponent("dit_\(name).json"))
-        var parts: [MLXArray] = []
-        for i in 0..<(j["refs"] as! [Any]).count {
-            parts.append(Flux3Latents.tokens(fromPacked: encoder.encodePacked(g["in.ref_pixels.\(i)"]![.newAxis])))
+        let count = (j["refs"] as! [Any]).count
+        func tokens(_ tile: Flux2VAETile?) -> MLXArray {
+            concatenated((0..<count).map { i in
+                let pixels = g["in.ref_pixels.\(i)"]![.newAxis]
+                return Flux3Latents.tokens(fromPacked: tile.map { encoder.encodePacked(pixels, tile: $0) }
+                    ?? encoder.encodePacked(pixels))
+            }, axis: 0)
         }
-        report("encode \(name) tokens", compare(concatenated(parts, axis: 0), g["in.cond"]!), cosGate: 0.99999, relGate: 5e-3)
+        let untiled = tokens(nil)
+        report("encode \(name) tokens", compare(untiled, g["in.cond"]!), cosGate: 0.99999, relGate: 5e-3)
+        // The pipeline's default (row bands, flux2-vae-mlx-swift 0.7.0), and 1 MB bands so a 256² reference splits.
+        for (label, tile) in [("standard", Flux2VAETile.standard), ("1 MB bands", Flux2VAETile(bandBytes: 1 << 20))] {
+            let tiled = tokens(tile)
+            report("encode \(name) tiled \(label)", compare(tiled, g["in.cond"]!), cosGate: 0.99999, relGate: 5e-3)
+            report("  tiled vs untiled", compare(tiled, untiled), cosGate: 0.9999999, relGate: 2e-4)
+        }
     }
     let run = try MLX.loadArrays(url: goldens.appendingPathComponent("run_512.safetensors"))
     let latents = Flux3Latents.packed(fromTokens: run["latents.15"]!, height: 32, width: 32)

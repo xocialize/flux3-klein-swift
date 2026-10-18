@@ -46,11 +46,12 @@ final class Flux3KleinPackageTests: XCTestCase {
         XCTAssertNotNil(Flux3KleinEnvelope.violation(width: 1024, height: nil, referenceCount: 0))
     }
 
-    /// v0.3.0 (row-band decode): output up to 2048², a single reference capped below it at the measured 1664².
+    /// v0.4.0 (row-band decode and reference encode): output and a single reference both up to 2048², the reference's
+    /// own 4 MiP.
     func testEnvelopeCaps() {
         XCTAssertEqual(Flux3KleinEnvelope.maxOutputPixels, 2048 * 2048)
-        XCTAssertEqual(Flux3KleinEnvelope.maxReferencePixels, 1664 * 1664)
-        XCTAssertLessThan(Flux3KleinEnvelope.maxReferencePixels, Flux3KleinEnvelope.maxOutputPixels)
+        XCTAssertEqual(Flux3KleinEnvelope.maxReferencePixels, 2048 * 2048)
+        XCTAssertEqual(Flux3KleinEnvelope.maxReferencePixels, Flux3References.matchMaxPixels)
     }
 
     /// The declaration keeps a 24 GB Mac's budget (19.07 GB, recommendedMaxWorkingSetSize on an M5 Pro, AB-R-0551) on

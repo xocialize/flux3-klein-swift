@@ -46,8 +46,8 @@ public enum Flux3KleinPackageError: Error, LocalizedError {
 public enum Flux3KleinEnvelope {
     /// Output area cap (2048², 4.19 MP). The row-band decode made the output cheap (~1.7 GB per MP, AB-R-0577).
     public static let maxOutputPixels = Flux3KleinFootprints.envelopeMaxPixels
-    /// A single reference is fitted to this area (1664², 2.77 MP) where the reference allows 4 MiP: its fp32 VAE
-    /// encode is untiled, ~4.1 GB per MP, and a 2048² reference would take the activation from 11.3 to 18.7 GB (AB-R-0579).
+    /// A single reference is fitted to this area (2048², 4.19 MP), the reference's own 4 MiP: since v0.4.0 its fp32 VAE
+    /// encode runs in row bands, so a 2048² reference costs 7.22 GB activation, what a 2048² output does (AB-R-0580).
     /// Several references are each fitted under 1 MiP by the model itself.
     public static let maxReferencePixels = Flux3KleinFootprints.envelopeReferenceMaxPixels
     public static let minSide = 64
@@ -219,7 +219,7 @@ enum Flux3KleinServing {
                 IEditContract.descriptor(
                     name: "flux-3-klein",
                     summary: "FLUX 3 Image Klein editing and composition with up to 10 reference images. One reference "
-                        + "keeps its own size, fitted under 2.77 MP (1664²); several are each fitted under 1 MP. Write the "
+                        + "keeps its own size, fitted under 4.19 MP (2048²); several are each fitted under 1 MP. Write the "
                         + "caption as a complete description of the result, the edit folded in. Refer to the n-th "
                         + "reference as 'the n-th image', or as <ref_image_n> in box edits. " + promptGuidance
                         + " FLUX KOMMUNITY LICENCE (see text-to-image).",

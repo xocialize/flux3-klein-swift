@@ -271,6 +271,13 @@ it is ≈ 13 GB, before the upsampler.
 - **Declared:** activation 12.0 GB on every tier (was 15.5). Totals: bf16 23.7, int8 18.7, int4 16.9 GB.
   phys_footprint peaks: bf16 24.5 GB, int4 17.8 GB (was 28.2 / 21.4 at the 1152² cap).
 - Next lever: a row-band VAE **encode** (flux2-vae-mlx-swift) would let a single reference follow the output to 2048².
+- **v0.4.0 (2026-10-17):** that encode landed (flux2-vae-mlx-swift 0.7.0, AB-R-0580: 2048² fp32 encode 22.72 → 4.63 GB,
+  tiled vs untiled ≤ 1.4e-5). The pipeline's reference encode follows `vaeTile`.
+  - `--vae` gate: tiled encode vs BFL is cos 0.999999 / relMax 1.90e-3, the same as untiled; tiled vs untiled 2.5–3.8e-5.
+  - Ledger `outputs/envelope-v040.log`: 1 reference at its own size, 1024² 4.29 → 2.35, 1536² 9.66 → 4.38, 2048²
+    18.66 → 7.22 GB (int4 the same); 10 refs into 2048² 10.32, unchanged.
+  - **Envelope:** a single reference fitted to 2048² (the reference's 4 MiP). The worst request is 10 refs into 2048²,
+    10.32 GB, so the declared 12.0 GB holds. phys peaks bf16 22.8 GB, int4 16.0 GB.
 
 **P4 — upsampler**
 - Convert the upsampler (Qwen3.5-9B VL) to MLX int4/int8 and run it through `MLXVLM`, using
