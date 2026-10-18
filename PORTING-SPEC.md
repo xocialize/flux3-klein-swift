@@ -1,7 +1,7 @@
 # flux3-klein-swift — Porting spec: FLUX 3 Image Klein → Swift/MLX
 
-Status: **P0 done; P1 DiT gate green 2026-10-17.** The goldens are in `WIP/flux3-klein-oracle`; the conditioner, pipeline
-and package come next (the spec was written the same day, four days after release). It is a
+Status: **P0–P2 done 2026-10-17.** The engine-free pipeline is gated end to end against BFL's renders (README).
+P3 (quant, footprint) and P5 (engine package) come next (the spec was written the same day, four days after release). It is a
 **restricted, named-only tier for the Pixel Agency Image Engine** (`pixel-agency-image-engine`, with its MES HTTP and MCP
 bindings), not a product
 asset, following the Qwen-Image-2.1 precedent (AB-D-0085, AB-D-0116). The licence posture is in §1.
@@ -192,6 +192,17 @@ it is ≈ 13 GB, before the upsampler.
   - an empty mode is skipped instead of carrying a phantom token;
   - RoPE tables are built in Double on the CPU (the reference uses float64).
 - Still to do: the conditioner tap, reference prep, the pipeline, and the bf16 GPU e2e.
+
+**P1/P2 done (2026-10-17):**
+- Conditioner:
+  - qwen3vl-mlx-swift 0.5.1 adds `hiddenStates(inputIds:layers:mask:positionIds:)`.
+  - Pad rows: every pad row is the same token at position 1 attending to the real keys, so one masked pad row is
+    run and broadcast. It is exact against the reference's padded forward.
+- VAE: flux2-vae-mlx-swift 0.5.0 (`Flux2VAEEncoder`).
+- Reference prep: byte-exact.
+- `Flux3KleinPipeline`.
+- bf16 GPU e2e vs BFL: 35.9 / 39.8 / 52.7 / 30.9 dB, where BFL's code on MPS scores 35.8 / 42.5 / 56.2.
+- Speed at 1024² on an M5 Max: 1.2 s per step for T2I, 2.3 s per step with one reference.
 
 **P2 — gates** (`Flux3KleinGate`)
 - Conditioner: cos 1.0 on text cases.

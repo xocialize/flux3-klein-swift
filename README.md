@@ -25,24 +25,45 @@ at `bfc8889`, Apache-2.0), not diffusers. The spec, the architecture delta from 
 
 ## Status
 
-| Piece | State |
+The engine-free pipeline is **done and gated** (`Flux3KleinPipeline`): T2I, single- and multi-reference edits, box
+layouts in the caption. Next comes the MLXEngine package and its registration in Pixel Agency Image Engine
+(PORTING-SPEC.md P3–P5).
+
+| Piece | Gate |
 |---|---|
-| DiT (`Flux3Transformer`) | **Gate green, fp32 CPU.** Every stage on t2i, 1-ref and 3-ref matches at cos ≥ 0.9999998 (relMax ≤ 2.1e-5). The 16-step 512² trajectory matches at relMax ≤ 1.7e-4 |
-| Flow-map schedule | Gate green (exact). α = 6.93 from `config.json`; the reference CLI's 16.0 does not reproduce BFL's renders |
-| Conditioner (Qwen3-VL-4B, 8 taps → 20480) | P1, next. Needs a `hiddenStates(layers:)` tap in qwen3vl-mlx-swift |
-| VAE | No port: FLUX 3's VAE is the FLUX.2 VAE, identical weights. Uses flux2-vae-mlx-swift |
-| Pipeline, reference prep, MLXEngine package | P1–P5 |
+| DiT (`Flux3Transformer`) | fp32 CPU: every stage on t2i, 1-ref and 3-ref at cos ≥ 0.9999998 (relMax ≤ 2.1e-5); the 16-step 512² trajectory at relMax ≤ 1.7e-4 |
+| Flow-map schedule | Exact. α = 6.93 from `config.json`; the reference CLI's 16.0 does not reproduce BFL's renders |
+| Conditioner (`Flux3TextEncoder`, Qwen3-VL-4B, 8 taps → 20480) | fp32 CPU: token ids exact; features cos ≥ 0.99998 on real and padded rows (the pad rows come from one masked pad token, broadcast) |
+| VAE (flux2-vae-mlx-swift ≥ 0.5.0, the same weights as FLUX.2) | Encoder tokens cos 0.999999; 512² decode cos 0.9999999 (GPU fp32) |
+| Reference prep (`Flux3References`) | Byte-identical to the reference on 5 cases: reflect pad, LANCZOS fit > 4 MiP, symmetric tiny pad, multi-ref resize + crop, multi-ref crop |
+| End to end, bf16 GPU (`--e2e`) | Replaying the reference's torch noise, PSNR against BFL's own example renders, the same level as BFL's own code on MPS (table below) |
+
+| BFL example | Swift bf16 vs BFL | torch MPS oracle vs BFL | M5 Max, 16 steps |
+|---|---|---|---|
+| knitted diorama, T2I + boxes, 1184×896 | 35.9 dB | 35.8 dB | 18.9 s |
+| coffee + croissant, 1-ref edit, 1024² | 39.8 dB | 42.5 dB | 37.1 s |
+| mug print, 2-ref composition, 1024² | 52.7 dB | 56.2 dB | 61.7 s |
+| figurine on a desk, 1-ref edit, 896×1120 | 30.9 dB | — | 44.3 s |
+
+Prompting: the model wants a **full scene caption**. Run a prompt upsampler first: BFL's
+[flux-3-image-klein-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup), or any LLM given its
+`system_prompts.json`. Boxes go after the caption as a JSON list on a 0–1000 grid.
 
 ## Gate
 
 ```bash
 swift build -c release --product Flux3KleinGate
 .build/release/Flux3KleinGate --sched <goldens>
+.build/release/Flux3KleinGate --encoder <snapshot> <goldens>    # conditioner, fp32 CPU
+.build/release/Flux3KleinGate --vae <snapshot> <goldens> --gpu  # encoder + decoder
+.build/release/Flux3KleinGate --prep <goldens>/prep             # reference prep, byte-exact
+.build/release/Flux3KleinGate --e2e <snapshot> <oracleDir> <example.json>...  # bf16 GPU vs BFL renders
 .build/release/Flux3KleinGate --dit <snapshot> <goldens>        # fp32 CPU; --gpu for the same math on the GPU
 .build/release/Flux3KleinGate --run <snapshot> <goldens>        # the 16-step trajectory
 ```
 
-`<snapshot>` holds BFL's `model.safetensors` (the native DiT, 359 tensors, sha256 in `manifest.json`).
+`<snapshot>` is the HF repo's bf16 package: `model.safetensors` (the native DiT, 359 tensors, sha256 in `manifest.json`),
+`text_encoder/` and `vae/`.
 
 **On the GPU in fp32**, one forward is still exact (relMax ~1e-5). Over the 16 chained steps, though, MLX's GPU fp32
 matmul drifts to cos 0.99957 at the last latents. That is compounding precision, not a port defect: the same code on

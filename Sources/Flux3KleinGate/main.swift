@@ -1,6 +1,10 @@
 // Flux3KleinGate — parity gates against the oracle goldens (mlxengine-image/WIP/flux3-klein-oracle).
 //
 //   Flux3KleinGate --sched <goldensDir>
+//   Flux3KleinGate --prep <prepGoldensDir>
+//   Flux3KleinGate --e2e <snapshot> <oracleDir> <example.json>... [--mlx-noise]
+//   Flux3KleinGate --vae <snapshot> <goldensDir> [--gpu]
+//   Flux3KleinGate --encoder <snapshot> <goldensDir> [--gpu] [--bf16]
 //   Flux3KleinGate --dit <snapshot> <goldensDir> [--case t2i|ref1|ref3] [--gpu]
 //   Flux3KleinGate --run <snapshot> <goldensDir> [--gpu]
 //
@@ -9,6 +13,7 @@
 // golden noise (text features from the dit_t2i golden — the same prompt and encoder), every step's latents.
 
 import Foundation
+import Flux2VAE
 import Flux3Klein
 import MLX
 
@@ -64,6 +69,128 @@ func gateSched(_ goldens: URL) throws {
         if !ok { failures += 1 }
         print(String(format: "  %@ schedule α=%.2f maxAbs %.2e  %@", ok ? "PASS" : "FAIL", alpha, maxAbs,
                      "\(ours.suffix(3))"))
+    }
+}
+
+func gateEncoder(snapshot: URL, goldens: URL, dtype: DType) async throws {
+    let start = Date()
+    let enc = try await Flux3TextEncoder.load(directory: snapshot.appendingPathComponent("text_encoder"), dtype: dtype)
+    print(String(format: "text encoder loaded (%@) in %.1fs", "\(dtype)", Date().timeIntervalSince(start)))
+    let g = try MLX.loadArrays(url: goldens.appendingPathComponent("encoder.safetensors"))
+    let j = try loadJSON(goldens.appendingPathComponent("encoder.json"))
+    let cosGate: Float = dtype == .float32 ? 0.9999 : 0.995
+    for name in ["short", "caption", "bbox"] {
+        let meta = j[name] as! [String: Any]
+        let real = meta["real_tokens"] as! Int, padded = meta["padded"] as! Int
+        let e = enc.encode(meta["prompt"] as! String)
+        eval(e.features)
+        let goldenIds = g["\(name).input_ids"]!.asType(.int32).asArray(Int32.self).map(Int.init)
+        let ours = e.tokenIds + Array(repeating: enc.padId, count: e.paddedLength - e.tokenIds.count)
+        let idsOK = ours == goldenIds && e.tokenIds.count == real && e.paddedLength == padded
+        if !idsOK { failures += 1 }
+        print("== \(name): \(idsOK ? "PASS" : "FAIL") token ids (real \(e.tokenIds.count)/\(real), padded \(e.paddedLength)/\(padded))")
+        let gf = g["\(name).features"]!
+        report("features (all rows)", compare(e.features, gf), cosGate: cosGate, relGate: dtype == .float32 ? 2e-2 : 0.2)
+        report("features real rows", compare(e.features[..<real], gf[..<real]), cosGate: cosGate,
+               relGate: dtype == .float32 ? 2e-2 : 0.2)
+        if padded > real {
+            report("features pad rows", compare(e.features[real...], gf[real...]), cosGate: cosGate,
+                   relGate: dtype == .float32 ? 2e-2 : 0.2)
+        }
+        report("text ids", compare(e.ids, g["\(name).ids"]!), cosGate: 0.9999999, relGate: 1e-7)
+        for (i, layer) in Flux3TextEncoder.outputLayers.enumerated() where [0, 7].contains(i) {
+            let slice = 2560 * i ..< 2560 * (i + 1)
+            report("  tap k=\(layer)", compare(e.features[0..., slice], gf[0..., slice]), cosGate: cosGate,
+                   relGate: dtype == .float32 ? 2e-2 : 0.2)
+        }
+    }
+}
+
+func gateVAE(snapshot: URL, goldens: URL) throws {
+    let vaeDir = snapshot.appendingPathComponent("vae")
+    let encoder = try Flux2VAEWeights.loadEncoder(directory: vaeDir, dtype: .float32)
+    let decoder = try Flux2VAEWeights.loadVAE(directory: vaeDir, dtype: .float32)
+    decoder.convRoute = .conv3d  // exact, for parity
+    for name in ["ref1", "ref3"] {
+        let g = try MLX.loadArrays(url: goldens.appendingPathComponent("dit_\(name).safetensors"))
+        let j = try loadJSON(goldens.appendingPathComponent("dit_\(name).json"))
+        var parts: [MLXArray] = []
+        for i in 0..<(j["refs"] as! [Any]).count {
+            parts.append(Flux3Latents.tokens(fromPacked: encoder.encodePacked(g["in.ref_pixels.\(i)"]![.newAxis])))
+        }
+        report("encode \(name) tokens", compare(concatenated(parts, axis: 0), g["in.cond"]!), cosGate: 0.99999, relGate: 5e-3)
+    }
+    let run = try MLX.loadArrays(url: goldens.appendingPathComponent("run_512.safetensors"))
+    let latents = Flux3Latents.packed(fromTokens: run["latents.15"]!, height: 32, width: 32)
+    report("decode 512²", compare(decoder.decodePackedLatents(latents)[0], run["decoded"]!), cosGate: 0.99999, relGate: 5e-3)
+}
+
+func psnr(_ a: Flux3RGBImage, _ b: Flux3RGBImage) -> Double {
+    guard a.width == b.width, a.height == b.height else { return -1 }
+    var se = 0.0
+    for i in 0..<a.rgb.count { let d = Double(a.rgb[i]) - Double(b.rgb[i]); se += d * d }
+    let mse = se / Double(a.rgb.count)
+    return mse == 0 ? .infinity : 10 * log10(255 * 255 / mse)
+}
+
+func gatePrep(_ dir: URL) throws {
+    let j = try loadJSON(dir.appendingPathComponent("prep.json"))
+    for name in j.keys.sorted() {
+        let meta = j[name] as! [String: Any]
+        let src = Flux3RGBImage(try Flux3PNG.read(url: dir.appendingPathComponent("\(name).src.png")))
+        let golden = Flux3RGBImage(try Flux3PNG.read(url: dir.appendingPathComponent("\(name).prep.png")))
+        let ours: Flux3RGBImage
+        var boxOK = true
+        if name.hasPrefix("single") {
+            let (img, box) = Flux3References.prepareSingle(src)
+            ours = img
+            let ref = meta["box"] as? [Int]
+            let mine = box.map { [$0.left, $0.top, $0.left + $0.width, $0.top + $0.height] }
+            boxOK = ref == mine
+        } else {
+            ours = Flux3References.prepareMulti(src)
+        }
+        let same = ours.width == golden.width && ours.height == golden.height && ours.rgb == golden.rgb
+        var maxDiff = 0
+        if ours.rgb.count == golden.rgb.count {
+            for i in 0..<ours.rgb.count { maxDiff = max(maxDiff, abs(Int(ours.rgb[i]) - Int(golden.rgb[i]))) }
+        }
+        let ok = same && boxOK
+        if !ok { failures += 1 }
+        print("  \(ok ? "PASS" : "FAIL") prep \(name): \(src.width)×\(src.height) → \(ours.width)×\(ours.height) "
+              + "(golden \(golden.width)×\(golden.height)) \(same ? "byte-identical" : "max |Δ| \(maxDiff)") box \(boxOK ? "ok" : "MISMATCH")")
+    }
+}
+
+func gateE2E(snapshot: URL, oracle: URL, examples: [URL]) async throws {
+    let start = Date()
+    let pipe = try await Flux3KleinPipeline.load(snapshot: snapshot)
+    print(String(format: "pipeline loaded (bf16 DiT + TE, fp32 VAE) in %.1fs", Date().timeIntervalSince(start)))
+    let outDir = URL(fileURLWithPath: "outputs/e2e")
+    try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+    for example in examples {
+        let r = try loadJSON(example)
+        let name = "\(example.deletingLastPathComponent().lastPathComponent)__\(example.deletingPathExtension().lastPathComponent)"
+        let refRoot = oracle.appendingPathComponent("ref")
+        let refs = try ((r["references"] as? [String]) ?? []).map { try Flux3RGBImage.read(url: refRoot.appendingPathComponent($0)) }
+        let req = Flux3KleinPipeline.Request(prompt: r["prompt"] as! String, references: refs,
+                                             width: r["width"] as? Int, height: r["height"] as? Int,
+                                             steps: r["steps"] as? Int ?? 16, seed: UInt32(r["seed"] as! Int))
+        let noise = has("--mlx-noise") ? nil
+            : try MLX.loadArrays(url: oracle.appendingPathComponent("e2e/noise/\(name).noise.safetensors"))["noise"]!
+        let t0 = Date()
+        let result = try pipe.generate(req, noise: noise)
+        let secs = Date().timeIntervalSince(t0)
+        let tag = has("--mlx-noise") ? "mlxnoise" : "torchnoise"
+        try result.image.write(to: outDir.appendingPathComponent("\(name)__\(tag).png"))
+        let bfl = Flux3RGBImage(try Flux3PNG.read(url: example.deletingPathExtension().appendingPathExtension("png")))
+        let mps = oracle.appendingPathComponent("e2e/\(name)__a6.93.png")
+        let vsOracle = FileManager.default.fileExists(atPath: mps.path)
+            ? psnr(result.image, Flux3RGBImage(try Flux3PNG.read(url: mps))) : -1
+        let timing = result.timings.sorted { $0.key < $1.key }.map { String(format: "%@ %.1fs", $0.key, $0.value) }
+            .joined(separator: ", ")
+        print(String(format: "  %@ %@ %d×%d  %.1fs (%@)  PSNR vs BFL %.2f dB, vs oracle MPS %.2f dB", name, tag,
+                     result.width, result.height, secs, timing, psnr(result.image, bfl), vsOracle))
     }
 }
 
@@ -133,6 +260,22 @@ func gateRun(_ model: Flux3Transformer, goldens: URL) throws {
 do {
     if has("--sched") {
         try gateSched(positional(after: "--sched", 1)[0])
+    } else if has("--prep") {
+        try gatePrep(positional(after: "--prep", 1)[0])
+    } else if has("--e2e") {
+        let a = CommandLine.arguments
+        let i = a.firstIndex(of: "--e2e")!
+        let snapshot = URL(fileURLWithPath: a[i + 1]), oracle = URL(fileURLWithPath: a[i + 2])
+        let examples = a[(i + 3)...].filter { $0.hasSuffix(".json") }.map { URL(fileURLWithPath: $0) }
+        try await gateE2E(snapshot: snapshot, oracle: oracle, examples: examples)
+    } else if has("--vae") {
+        let p = positional(after: "--vae", 2)
+        if !has("--gpu") { Device.setDefault(device: Device(.cpu)) }
+        try gateVAE(snapshot: p[0], goldens: p[1])
+    } else if has("--encoder") {
+        let p = positional(after: "--encoder", 2)
+        if !has("--gpu") { Device.setDefault(device: Device(.cpu)) }
+        try await gateEncoder(snapshot: p[0], goldens: p[1], dtype: has("--bf16") ? .bfloat16 : .float32)
     } else if has("--dit") || has("--run") {
         let flag = has("--dit") ? "--dit" : "--run"
         let p = positional(after: flag, 2)

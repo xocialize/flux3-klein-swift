@@ -1,0 +1,260 @@
+// Image I/O for the FLUX 3 klein pipeline: PIL-exact LANCZOS (Pillow's fixed-point kernel; copied from
+// qwen-image21-swift, MIT) and PNG/JPEG read/write via CoreGraphics. The reference works on RGB (`convert("RGB")`,
+// which drops alpha without compositing), so references are resampled as 3 bands.
+
+import CoreGraphics
+import Foundation
+import ImageIO
+import UniformTypeIdentifiers
+
+/// Straight (non-premultiplied) RGBA8, as decoded.
+public struct Flux3RGBAImage: Sendable {
+    public var rgba: [UInt8]
+    public var width: Int
+    public var height: Int
+
+    public init(rgba: [UInt8], width: Int, height: Int) {
+        precondition(rgba.count == width * height * 4)
+        self.rgba = rgba
+        self.width = width
+        self.height = height
+    }
+}
+
+// MARK: - PIL-exact LANCZOS (4 bands, premultiplied round trip)
+
+public enum Flux3PILResize {
+    static let precisionBits = 32 - 8 - 2
+
+    static func sinc(_ x: Double) -> Double {
+        if x == 0 { return 1 }
+        let p = Double.pi * x
+        return sin(p) / p
+    }
+
+    static func lanczos(_ xIn: Double) -> Double {
+        let x = abs(xIn)
+        return x < 3 ? sinc(x) * sinc(x / 3) : 0
+    }
+
+    static func coefficients(inSize: Int, outSize: Int) -> (bounds: [(min: Int, count: Int)], coeffs: [[Int32]]) {
+        let scale = Double(inSize) / Double(outSize)
+        let filterscale = max(scale, 1.0)
+        let support = 3.0 * filterscale
+        let one = Double(1 << precisionBits)
+        var bounds: [(Int, Int)] = []
+        var coeffs: [[Int32]] = []
+        for xx in 0..<outSize {
+            let center = (Double(xx) + 0.5) * scale
+            var xmin = Int(center - support + 0.5)
+            if xmin < 0 { xmin = 0 }
+            var xmax = Int(center + support + 0.5)
+            if xmax > inSize { xmax = inSize }
+            let count = xmax - xmin
+            var w = [Double](repeating: 0, count: count)
+            var total = 0.0
+            for x in 0..<count {
+                let v = lanczos((Double(x + xmin) - center + 0.5) / filterscale)
+                w[x] = v
+                total += v
+            }
+            var k = [Int32](repeating: 0, count: count)
+            for x in 0..<count {
+                let normalized = total != 0 ? w[x] / total : w[x]
+                let scaled = normalized * one
+                k[x] = Int32(scaled < 0 ? scaled - 0.5 : scaled + 0.5)
+            }
+            bounds.append((xmin, count))
+            coeffs.append(k)
+        }
+        return (bounds, coeffs)
+    }
+
+    @inline(__always) static func clip8(_ v: Int32) -> UInt8 {
+        UInt8(min(max(v >> Int32(precisionBits), 0), 255))
+    }
+
+    @inline(__always) static func mulDiv255(_ a: Int, _ b: Int) -> UInt8 {
+        let tmp = a * b + 128
+        return UInt8(truncatingIfNeeded: ((tmp >> 8) + tmp) >> 8)
+    }
+
+    /// Resample `bands` interleaved 8-bit channels (no alpha handling).
+    public static func resampleBands(_ src: [UInt8], bands: Int, width: Int, height: Int, outWidth: Int, outHeight: Int) -> [UInt8] {
+        let half = Int32(1 << (precisionBits - 1))
+        let (hB, hC) = coefficients(inSize: width, outSize: outWidth)
+        var temp = [UInt8](repeating: 0, count: height * outWidth * bands)
+        src.withUnsafeBufferPointer { s in
+            temp.withUnsafeMutableBufferPointer { d in
+                for y in 0..<height {
+                    let rowIn = y * width * bands
+                    let rowOut = y * outWidth * bands
+                    for xx in 0..<outWidth {
+                        let (xmin, count) = hB[xx]
+                        let k = hC[xx]
+                        for c in 0..<bands {
+                            var acc = half
+                            for x in 0..<count { acc += Int32(s[rowIn + (xmin + x) * bands + c]) * k[x] }
+                            d[rowOut + xx * bands + c] = clip8(acc)
+                        }
+                    }
+                }
+            }
+        }
+        let (vB, vC) = coefficients(inSize: height, outSize: outHeight)
+        var out = [UInt8](repeating: 0, count: outHeight * outWidth * bands)
+        temp.withUnsafeBufferPointer { s in
+            out.withUnsafeMutableBufferPointer { d in
+                for yy in 0..<outHeight {
+                    let (ymin, count) = vB[yy]
+                    let k = vC[yy]
+                    let rowOut = yy * outWidth * bands
+                    for xx in 0..<outWidth {
+                        for c in 0..<bands {
+                            var acc = half
+                            for y in 0..<count { acc += Int32(s[(ymin + y) * outWidth * bands + xx * bands + c]) * k[y] }
+                            d[rowOut + xx * bands + c] = clip8(acc)
+                        }
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// PIL `Image.resize((w, h), LANCZOS)` on an RGBA image (premultiplied round trip).
+    public static func resizeRGBA(_ image: Flux3RGBAImage, outWidth: Int, outHeight: Int) -> Flux3RGBAImage {
+        if image.width == outWidth && image.height == outHeight { return image }
+        let n = image.width * image.height
+        var pre = [UInt8](repeating: 0, count: n * 4)
+        for i in 0..<n {
+            let a = Int(image.rgba[i * 4 + 3])
+            pre[i * 4] = mulDiv255(Int(image.rgba[i * 4]), a)
+            pre[i * 4 + 1] = mulDiv255(Int(image.rgba[i * 4 + 1]), a)
+            pre[i * 4 + 2] = mulDiv255(Int(image.rgba[i * 4 + 2]), a)
+            pre[i * 4 + 3] = UInt8(a)
+        }
+        let r = resampleBands(pre, bands: 4, width: image.width, height: image.height, outWidth: outWidth, outHeight: outHeight)
+        var out = [UInt8](repeating: 0, count: outWidth * outHeight * 4)
+        for i in 0..<(outWidth * outHeight) {
+            let a = Int(r[i * 4 + 3])
+            if a == 255 || a == 0 {
+                out[i * 4] = r[i * 4]; out[i * 4 + 1] = r[i * 4 + 1]; out[i * 4 + 2] = r[i * 4 + 2]
+            } else {
+                out[i * 4] = UInt8(min(255, (255 * Int(r[i * 4])) / a))
+                out[i * 4 + 1] = UInt8(min(255, (255 * Int(r[i * 4 + 1])) / a))
+                out[i * 4 + 2] = UInt8(min(255, (255 * Int(r[i * 4 + 2])) / a))
+            }
+            out[i * 4 + 3] = UInt8(a)
+        }
+        return Flux3RGBAImage(rgba: out, width: outWidth, height: outHeight)
+    }
+}
+
+// MARK: - PNG I/O
+
+public enum Flux3PNG {
+    /// Decode a PNG/JPEG file to straight (non-premultiplied) RGBA8.
+    public static func read(url: URL) throws -> Flux3RGBAImage {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            throw Flux3KleinError.invalidInput("cannot open image at \(url.path)")
+        }
+        return try read(source: src, label: url.path)
+    }
+
+    /// Decode in-memory PNG/JPEG data to straight RGBA8.
+    public static func read(data: Data) throws -> Flux3RGBAImage {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else {
+            throw Flux3KleinError.invalidInput("cannot decode image data (\(data.count) bytes)")
+        }
+        return try read(source: src, label: "<data>")
+    }
+
+    static func read(source src: CGImageSource, label: String) throws -> Flux3RGBAImage {
+        guard let cg = CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCache: false] as CFDictionary)
+        else { throw Flux3KleinError.invalidInput("cannot decode image at \(label)") }
+        let w = cg.width, h = cg.height
+        // Draw into a premultiplied context is lossy for translucent pixels, so read the decoded
+        // bytes directly when they are already 8-bit RGBA/RGB.
+        if cg.bitsPerComponent == 8, let data = cg.dataProvider?.data as Data?,
+           cg.bitsPerPixel == 32 || cg.bitsPerPixel == 24
+        {
+            let info = cg.alphaInfo
+            let bpp = cg.bitsPerPixel / 8
+            let bpr = cg.bytesPerRow
+            let straight = info == .last || info == .noneSkipLast || info == .none
+            let premul = info == .premultipliedLast
+            let first = info == .first || info == .noneSkipFirst || info == .premultipliedFirst
+            if (straight || premul || first), cg.byteOrderInfo == .orderDefault || cg.byteOrderInfo == .order32Big {
+                var out = [UInt8](repeating: 255, count: w * h * 4)
+                data.withUnsafeBytes { (p: UnsafeRawBufferPointer) in
+                    for y in 0..<h {
+                        for x in 0..<w {
+                            let o = y * bpr + x * bpp
+                            let d = (y * w + x) * 4
+                            if bpp == 3 {
+                                out[d] = p[o]; out[d + 1] = p[o + 1]; out[d + 2] = p[o + 2]
+                            } else if first {
+                                let a = info == .noneSkipFirst ? 255 : p[o]
+                                var r = Int(p[o + 1]), g = Int(p[o + 2]), b = Int(p[o + 3])
+                                if info == .premultipliedFirst, a != 0, a != 255 { r = r * 255 / Int(a); g = g * 255 / Int(a); b = b * 255 / Int(a) }
+                                out[d] = UInt8(min(r, 255)); out[d + 1] = UInt8(min(g, 255)); out[d + 2] = UInt8(min(b, 255)); out[d + 3] = a
+                            } else {
+                                let a = info == .noneSkipLast || info == .none ? 255 : p[o + 3]
+                                var r = Int(p[o]), g = Int(p[o + 1]), b = Int(p[o + 2])
+                                if premul, a != 0, a != 255 { r = r * 255 / Int(a); g = g * 255 / Int(a); b = b * 255 / Int(a) }
+                                out[d] = UInt8(min(r, 255)); out[d + 1] = UInt8(min(g, 255)); out[d + 2] = UInt8(min(b, 255)); out[d + 3] = a
+                            }
+                        }
+                    }
+                }
+                return Flux3RGBAImage(rgba: out, width: w, height: h)
+            }
+        }
+        // Fallback: render through a premultiplied RGBA context (exact for opaque images).
+        var out = [UInt8](repeating: 0, count: w * h * 4)
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: &out, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { throw Flux3KleinError.invalidInput("cannot create bitmap context") }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        for i in 0..<(w * h) {
+            let a = Int(out[i * 4 + 3])
+            if a != 0, a != 255 {
+                for c in 0..<3 { out[i * 4 + c] = UInt8(min(255, Int(out[i * 4 + c]) * 255 / a)) }
+            }
+        }
+        return Flux3RGBAImage(rgba: out, width: w, height: h)
+    }
+
+    static func cgImage(_ image: Flux3RGBAImage) throws -> CGImage {
+        let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let provider = CGDataProvider(data: Data(image.rgba) as CFData),
+              let cg = CGImage(width: image.width, height: image.height, bitsPerComponent: 8, bitsPerPixel: 32,
+                               bytesPerRow: image.width * 4, space: cs,
+                               bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                               provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { throw Flux3KleinError.invalidInput("cannot build CGImage") }
+        return cg
+    }
+
+    /// Write straight RGBA8 as a PNG (alpha preserved).
+    public static func write(_ image: Flux3RGBAImage, to url: URL) throws {
+        let cg = try cgImage(image)
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
+        else { throw Flux3KleinError.invalidInput("cannot create PNG destination") }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest) else { throw Flux3KleinError.invalidInput("PNG write failed: \(url.path)") }
+    }
+
+    /// Straight RGBA8 -> PNG bytes (alpha preserved) — the engine's canonical image artifact.
+    public static func pngData(_ image: Flux3RGBAImage) throws -> Data {
+        let cg = try cgImage(image)
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil)
+        else { throw Flux3KleinError.invalidInput("cannot create PNG destination") }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest) else { throw Flux3KleinError.invalidInput("PNG encode failed") }
+        return out as Data
+    }
+}
