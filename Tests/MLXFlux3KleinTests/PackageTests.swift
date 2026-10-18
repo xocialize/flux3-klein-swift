@@ -133,6 +133,7 @@ final class Flux3KleinPackageTests: XCTestCase {
         let e = Flux3KleinPackageError.contentRefused("Reference image 2 may show nudity or other adult content.")
         XCTAssertEqual(e.errorDescription,
                        "FLUX 3 Image Klein safety check refused the request: Reference image 2 may show nudity or other adult content.")
+        XCTAssertEqual("\(e)", e.errorDescription, "an engine that interpolates the error shows the sentence")
     }
 
     func testMetaDataLevers() throws {

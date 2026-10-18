@@ -22,7 +22,9 @@ extension SPDXLicense {
     public static let fluxKommunity: SPDXLicense = "LicenseRef-FLUX-Kommunity-1.0"
 }
 
-public enum Flux3KleinPackageError: Error, LocalizedError {
+/// `description` is the readable message too: engines that report `"\(error)"` (Pixel Agency Image Engine's MES
+/// `engine_error`) show the sentence, not the enum case.
+public enum Flux3KleinPackageError: Error, LocalizedError, CustomStringConvertible {
     case unreadableSnapshot(String)
     case imageDecode
     case pngEncode
@@ -44,6 +46,8 @@ public enum Flux3KleinPackageError: Error, LocalizedError {
         case .contentRefused(let why): return "FLUX 3 Image Klein safety check refused the request: \(why)"
         }
     }
+
+    public var description: String { errorDescription ?? "FLUX 3 Image Klein error" }
 }
 
 /// The input envelope the manifest's footprint was measured at (Flux3KleinFootprints). `run()` refuses anything
