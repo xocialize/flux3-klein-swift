@@ -27,7 +27,7 @@ let package = Package(
         // Qwen3-VL conditioner backbone; ≥ 0.6.0: hiddenStates taps (0.5.1) and the text-only load.
         .package(url: "https://github.com/xocialize/qwen3vl-mlx-swift", from: "0.6.0"),
         // The FLUX.2 VAE (FLUX 3 ships identical weights, AB-R-0571); ≥ 0.5.0 for Flux2VAEEncoder.
-        .package(url: "https://github.com/xocialize/flux2-vae-mlx-swift", from: "0.7.0"),
+        .package(url: "https://github.com/xocialize/flux2-vae-mlx-swift", from: "0.8.0"),
         // MLXVLM (Qwen3.5 VL) for the prompt upsampler.
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.32.3"),
         // MLXEngine contract (MLXToolKit) + conformance gates, for the wrapper only.

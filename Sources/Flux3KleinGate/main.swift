@@ -13,6 +13,10 @@
 //                  [--steps 2] [--drop-te] [--hold 6] [--untiled]   (footprint ledger: load, one request, hold for `footprint`)
 //   Flux3KleinGate --package <snapshot> <oracleDir> [--quant int8] [--steps 16]   (the ModelPackage path: load, T2I and
 //                  a 1-ref edit through run(), PNGs to outputs/package/, and an envelope refusal)
+//   Flux3KleinGate --upscale <snapshot> <outDir> [--quant bf16] [--steps 16] [--models-root dir] [--names a,b]
+//                  (AB-A-0257: AB-R-0795's six prompts as typed through run() at 1024², then metaData latentUpscale 1
+//                  and 2 with the same seed → <outDir>/<name>-x1|x2|x4.png; wall time, MLX peak over resident and the
+//                  process phys_footprint peak per run, 2 GB pool cap; a 1-ref edit ×2 checks the crop; refusals)
 //   Flux3KleinGate --package-safety <snapshot> <oracleDir> [--quant bf16] [--pup-dir dir|off]   (the package with the
 //                  safety checks on: a benign request passes, a named character is refused, a benign edit passes)
 //   Flux3KleinGate --vae <snapshot> <goldensDir> [--gpu]   (decode untiled and in row bands)
@@ -405,6 +409,82 @@ func packageSmoke(snapshot: URL, oracle: URL) async throws {
     await package.unload()
 }
 
+/// The process's lifetime-max phys_footprint, GB.
+func physPeakGB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    return kr == KERN_SUCCESS ? Double(info.ledger_phys_footprint_peak) / 1e9 : 0
+}
+
+@InferenceActor
+func upscaleRuns(snapshot: URL, out: URL) async throws {
+    let quant = Quant(rawValue: arg("--quant") ?? "bf16") ?? .bf16
+    let steps = Int(arg("--steps") ?? "16")!
+    let root = arg("--models-root").map { URL(fileURLWithPath: $0) }
+    let prompts: [(String, String, UInt64)] = [
+        ("portrait", "A close-up photograph of an elderly fisherman with a weathered face and a grey beard, wearing a wool cap, soft morning light, harbour behind him", 11),
+        ("forest", "A misty pine forest at dawn, sunbeams through the trees, moss and ferns on the ground, a narrow dirt path", 22),
+        ("sign", "A vintage enamel shop sign on a brick wall that reads 'BAKERY - FRESH BREAD DAILY', photographed straight on", 33),
+        ("cat", "A tabby cat sitting on a windowsill, detailed fur and whiskers, green eyes, a city street out of focus behind", 44),
+        ("city", "An aerial photograph of a dense old European city with red tile roofs, a cathedral and narrow streets, midday", 55),
+        ("illustration", "A detailed ink and watercolour illustration of a lighthouse on a rocky island with seabirds, storybook style", 66),
+    ]
+    let names = arg("--names").map { Set($0.split(separator: ",").map(String.init)) }
+    Memory.cacheLimit = 2 * 1_073_741_824  // MLXServeCore .automatic
+    let package = Flux3KleinPackage(configuration: Flux3KleinConfiguration(
+        quant: quant, snapshotPath: snapshot.path, upsampler: .off, modelsRootDirectory: root))
+    try await package.load()
+    let resident = Memory.activeMemory
+    print(String(format: "package loaded (%@), MLX resident %.2f GB", quant.rawValue, Double(resident) / 1e9))
+    try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    for (name, prompt, seed) in prompts where names?.contains(name) ?? true {
+        for passes in 0 ... 2 {
+            Memory.peakMemory = 0
+            let t0 = Date()
+            let r = try await package.run(T2IRequest(prompt: prompt, width: 1024, height: 1024, steps: steps, seed: seed,
+                                                     metaData: ["upsample": .bool(false), "latentUpscale": .int(passes)]))
+            guard let image = (r as? T2IResponse)?.image else { failures += 1; print("FAIL \(name): no image"); continue }
+            try image.data.write(to: out.appendingPathComponent("\(name)-x\(1 << passes).png"))
+            print(String(format: "  %@ latentUpscale=%d → %dx%d: %.2f s, MLX peak over resident %.2f GB, phys peak %.2f GB",
+                         name, passes, image.width ?? 0, image.height ?? 0, Date().timeIntervalSince(t0),
+                         Double(Memory.peakMemory - resident) / 1e9, physPeakGB()))
+            Memory.clearCache()
+        }
+    }
+    if names == nil || names!.contains("edit") {
+        // A 1-ref edit at its own size, ×2: the padded reference's crop box scales with the image.
+        let photo = try Data(contentsOf: URL(fileURLWithPath: arg("--edit-image")
+            ?? "/Volumes/Satechi/Development/mlxengine-image/WIP/flux3-klein-oracle/ref/examples/inputs/2.png"))
+        for passes in [0, 1] {
+            let t0 = Date()
+            let r = try await package.run(IEditRequest(
+                images: [Image(format: .png, data: photo)],
+                prompt: "A photograph of the same sunlit wooden windowsill and white mug, now filled with black coffee, "
+                    + "with a golden croissant beside the mug; same camera position and light.",
+                steps: steps, seed: 21, metaData: ["upsample": .bool(false), "latentUpscale": .int(passes)]))
+            guard let image = (r as? IEditResponse)?.image else { failures += 1; print("FAIL edit"); continue }
+            try image.data.write(to: out.appendingPathComponent("edit\(arg("--edit-image") == nil ? "" : "-odd")-x\(1 << passes).png"))
+            print(String(format: "  edit latentUpscale=%d → %dx%d in %.1f s", passes, image.width ?? 0, image.height ?? 0,
+                         Date().timeIntervalSince(t0)))
+        }
+    }
+    for (w, h, n) in [(2048, 1024, 1), (1024, 1024, 3)] {
+        do {
+            _ = try await package.run(T2IRequest(prompt: "x", width: w, height: h, steps: 1,
+                                                 metaData: ["upsample": .bool(false), "latentUpscale": .int(n)]))
+            failures += 1; print("  FAIL: \(w)×\(h) latentUpscale \(n) was not refused")
+        } catch {
+            print("  PASS refusal \(w)×\(h) latentUpscale \(n): \(error.localizedDescription)")
+        }
+    }
+    await package.unload()
+}
+
 /// The package path with the safety checks on: a benign short request (upsampled), a named character (refused at the
 /// prompt check), and a benign 1-ref edit (the reference and output checks). `--pup-dir off` puts the judge on
 /// Qwen3-VL-4B instead of the upsampler. Per request: wall time and the MLX peak above resident (2 GB pool cap).
@@ -739,6 +819,9 @@ do {
                              classifierDir: arg("--classifier") ?? "/Volumes/Satechi/Development/mlxengine-image/weights/nsfw-classifier")
     } else if has("--boxes") {
         try gateBoxes(positional(after: "--boxes", 1)[0])
+    } else if has("--upscale") {
+        let p = positional(after: "--upscale", 2)
+        try await upscaleRuns(snapshot: p[0], out: p[1])
     } else if has("--package-safety") {
         let p = positional(after: "--package-safety", 2)
         try await packageSafetySmoke(snapshot: p[0], oracle: p[1])

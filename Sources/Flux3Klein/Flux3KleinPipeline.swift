@@ -23,6 +23,11 @@ public final class Flux3KleinPipeline {
     /// Row-band size for the fp32 VAE decode and reference encode; nil runs each untiled (the decode at about 4× the
     /// peak; a single reference's encode at ~4.1 GB per MP).
     public var vaeTile: Flux2VAETile? = .standard
+    /// FlowUpscaler (flux2-vae-mlx-swift 0.8.0), for requests with `latentUpscale` > 0 (AB-A-0257). FLUX 3 Klein's VAE is
+    /// FLUX.2's (251/251 tensors identical), so its latents are the upscaler's.
+    public var latentUpscaler: FlowUpscaler?
+    /// The largest draw a latent upscale starts from (FlowUpscaler was distilled at 512 → 1024).
+    public static let latentUpscaleMaxDrawPixels = 1024 * 1024
 
     public init(transformer: Flux3Transformer, textEncoder: Flux3TextEncoder?, vaeEncoder: Flux2VAEEncoder,
                 vae: Flux2VAE, snapshot: URL) {
@@ -61,6 +66,10 @@ public final class Flux3KleinPipeline {
         /// A single reference is fitted to this area (the reference's 4 MiP by default; engine packages cap it to
         /// their measured envelope).
         public var referenceMaxPixels: Int = Flux3References.matchMaxPixels
+        /// ×2 latent-upscale passes before the decode: 0 (none), 1 (×2) or 2 (×4). The draw (`width` × `height`, or
+        /// the reference's size) must be at most 1024² of area; the image comes back 2^passes larger on each side.
+        /// Pass i's noise comes from `seed + i`. Needs `latentUpscaler`.
+        public var latentUpscale: Int = 0
 
         public init(prompt: String, references: [Flux3RGBImage] = [], width: Int? = nil, height: Int? = nil,
                     steps: Int = Flux3Schedule.defaultSteps, alpha: Double = Flux3Schedule.defaultAlpha,
@@ -129,6 +138,7 @@ public final class Flux3KleinPipeline {
         guard width % 16 == 0, height % 16 == 0 else {
             throw Flux3KleinError.invalidInput("width and height must be multiples of 16 (got \(width)×\(height))")
         }
+        try checkLatentUpscale(request.latentUpscale, width: width, height: height)
         var condTokens: [MLXArray] = []
         var condIDs: [MLXArray] = []
         for (n, reference) in references.enumerated() {
@@ -148,7 +158,8 @@ public final class Flux3KleinPipeline {
         var result = try denoiseAndDecode(
             features: text.features, textIDs: text.ids, condTokens: condTokens, condIDs: condIDs, width: width,
             height: height, steps: request.steps, alpha: request.alpha,
-            seed: request.seed ?? Self.defaultSeed(request.prompt), noise: providedNoise, crop: crop, progress: progress)
+            seed: request.seed ?? Self.defaultSeed(request.prompt), noise: providedNoise, crop: crop,
+            latentUpscale: request.latentUpscale, progress: progress)
         result.timings.merge(timings) { a, _ in a }
         return result
     }
@@ -166,10 +177,23 @@ public final class Flux3KleinPipeline {
                                     progress: nil)
     }
 
+    func checkLatentUpscale(_ passes: Int, width: Int, height: Int) throws {
+        guard passes != 0 else { return }
+        guard (1 ... 2).contains(passes) else {
+            throw Flux3KleinError.invalidInput("latentUpscale: 1 (×2) or 2 (×4) passes (got \(passes))")
+        }
+        guard latentUpscaler != nil else { throw Flux3KleinError.invalidInput("latentUpscale needs latentUpscaler") }
+        guard width * height <= Self.latentUpscaleMaxDrawPixels else {
+            throw Flux3KleinError.invalidInput(
+                "latentUpscale draws at most 1024² of area and upscales that (the draw is \(width)×\(height))")
+        }
+    }
+
     func denoiseAndDecode(features rawFeatures: MLXArray, textIDs: MLXArray, condTokens: [MLXArray],
                           condIDs: [MLXArray], width: Int, height: Int, steps: Int, alpha: Double, seed: UInt32,
-                          noise providedNoise: MLXArray?, crop: Flux3References.Box?,
+                          noise providedNoise: MLXArray?, crop: Flux3References.Box?, latentUpscale: Int = 0,
                           progress: ((Int, Int) throws -> Void)?) throws -> Result {
+        try checkLatentUpscale(latentUpscale, width: width, height: height)
         var timings: [String: Double] = [:]
         var clock = Date()
         func lap(_ name: String) { timings[name] = Date().timeIntervalSince(clock); clock = Date() }
@@ -200,11 +224,20 @@ public final class Flux3KleinPipeline {
         }
         lap("denoise")
 
-        // Decode (fp32), crop back to a padded single reference's box.
-        let packed = Flux3Latents.packed(fromTokens: x, height: lh, width: lw)
-        let decoded = vaeTile.map { vae.decodePackedLatents(packed, tile: $0) } ?? vae.decodePackedLatents(packed)
+        // Latent upscale (AB-A-0257), then decode (fp32), crop back to a padded single reference's box.
+        var packed = Flux3Latents.packed(fromTokens: x, height: lh, width: lw)
+        let scale = 1 << latentUpscale
+        if latentUpscale > 0, let latentUpscaler {
+            packed = latentUpscaler.upscalePacked(packed, passes: latentUpscale, seed: UInt64(seed))
+            lap("upscale")
+        }
+        let tile = latentUpscale > 0 ? (vaeTile ?? .standard) : vaeTile
+        let decoded = tile.map { vae.decodePackedLatents(packed, tile: $0) } ?? vae.decodePackedLatents(packed)
         var image = Flux3RGBImage.fromPixels(decoded[0])
-        if let crop { image = image.cropped(left: crop.left, top: crop.top, width: crop.width, height: crop.height) }
+        if let crop {
+            image = image.cropped(left: crop.left * scale, top: crop.top * scale, width: crop.width * scale,
+                                  height: crop.height * scale)
+        }
         lap("decode")
         return Result(image: image, seed: seed, width: image.width, height: image.height, timings: timings)
     }

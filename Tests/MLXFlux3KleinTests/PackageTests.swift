@@ -10,6 +10,7 @@ import XCTest
 final class Flux3KleinPackageTests: XCTestCase {
     static let weights = "/Volumes/Satechi/Development/mlxengine-image/weights/flux-3-image-klein"
     static let classifier = "/Volumes/Satechi/Development/mlxengine-image/weights/nsfw-classifier"
+    static let latentUpscaler = "/Volumes/DEV_VOL1/Models/models--mlx-community--FlowUpscaler-bf16"
 
     /// C7: the FLUX Kommunity License, package-local and NOT allowlisted (AB-D-0151); C8: MIT.
     func testManifestIsKommunityAndNotPermissive() {
@@ -75,7 +76,7 @@ final class Flux3KleinPackageTests: XCTestCase {
     }
 
     func testWeightSourceIsThePinnedMirror() {
-        let s = Flux3KleinConfiguration(upsampler: .off).weightSources
+        let s = Flux3KleinConfiguration(upsampler: .off, latentUpscaler: false).weightSources
         XCTAssertEqual(s.map(\.repo), ["mlx-community/flux-3-image-klein-bf16"])
         XCTAssertEqual(s.first?.revision?.count, 40)  // a commit, never a moving "main"
         XCTAssertTrue(s.first?.matching?.contains("NOTICE.md") ?? false)  // §3: the notice travels with the weights
@@ -83,7 +84,7 @@ final class Flux3KleinPackageTests: XCTestCase {
 
     /// The upsampler is on by default (int8), from its own pinned mirror; `.off` drops the source.
     func testUpsamplerSources() {
-        let s = Flux3KleinConfiguration().weightSources
+        let s = Flux3KleinConfiguration(latentUpscaler: false).weightSources
         XCTAssertEqual(s.map(\.role), ["snapshot", "upsampler"])
         XCTAssertEqual(s.last?.repo, "mlx-community/flux-3-image-klein-pup-8bit")
         for tier in Flux3UpsamplerTier.allCases where tier != .off {
@@ -105,7 +106,7 @@ final class Flux3KleinPackageTests: XCTestCase {
         XCTAssertFalse(off.weightSources.contains { $0.role == "safety" })
         XCTAssertNil(off.resolvedSafetyDirectory(storeRoot: nil))
         let on = Flux3KleinConfiguration(safetyChecks: true)
-        let source = try XCTUnwrap(on.weightSources.last)
+        let source = try XCTUnwrap(on.weightSources.first { $0.role == "safety" })
         XCTAssertEqual(source.role, "safety")
         XCTAssertEqual(source.repo, "Falconsai/nsfw_image_detection")
         XCTAssertEqual(source.revision?.count, 40)
@@ -121,11 +122,13 @@ final class Flux3KleinPackageTests: XCTestCase {
     func testMATGateWithSafety() {
         let haveLocal = FileManager.default.fileExists(atPath: Self.weights + "/model.safetensors")
             && FileManager.default.fileExists(atPath: Self.classifier + "/model.safetensors")
+            && FileManager.default.fileExists(atPath: Self.latentUpscaler + "/flow_upscaler.safetensors")
         let report = MaterializationConformance.check(
             freshConfiguration: Flux3KleinConfiguration(safetyChecks: true),
             satisfiedConfiguration: haveLocal
                 ? Flux3KleinConfiguration(snapshotPath: Self.weights, upsamplerPath: Self.weights + "-pup",
-                                          safetyChecks: true, safetyClassifierPath: Self.classifier) : nil)
+                                          safetyChecks: true, safetyClassifierPath: Self.classifier,
+                                          latentUpscalerPath: Self.latentUpscaler) : nil)
         XCTAssertTrue(report.passed, report.summary)
     }
 
@@ -155,10 +158,12 @@ final class Flux3KleinPackageTests: XCTestCase {
 
     func testMATGate() {
         let haveLocal = FileManager.default.fileExists(atPath: Self.weights + "/model.safetensors")
+            && FileManager.default.fileExists(atPath: Self.latentUpscaler + "/flow_upscaler.safetensors")
         let report = MaterializationConformance.check(
             freshConfiguration: Flux3KleinConfiguration(),
             satisfiedConfiguration: haveLocal
-                ? Flux3KleinConfiguration(snapshotPath: Self.weights, upsamplerPath: Self.weights + "-pup") : nil)
+                ? Flux3KleinConfiguration(snapshotPath: Self.weights, upsamplerPath: Self.weights + "-pup",
+                                          latentUpscalerPath: Self.latentUpscaler) : nil)
         XCTAssertTrue(report.passed, report.summary)
     }
 

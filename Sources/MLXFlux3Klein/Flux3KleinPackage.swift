@@ -62,6 +62,17 @@ public enum Flux3KleinEnvelope {
     public static let minSide = 64
     /// The model's maximum, measured at 1024² references.
     public static let maxReferenceImages = Flux3References.maxReferences
+    /// With `latentUpscale`: the draw is at most 1024² of area, and the image at most 4096² (two passes).
+    public static let maxLatentUpscaleDrawPixels = Flux3KleinPipeline.latentUpscaleMaxDrawPixels
+    public static let maxUpscaledOutputPixels = Flux3KleinFootprints.envelopeUpscaledMaxPixels
+
+    /// nil when a latent upscale of `passes` fits, else a user-facing reason. nil sizes are the reference's prepared
+    /// size, checked by the pipeline.
+    public static func latentUpscaleViolation(width: Int?, height: Int?, passes: Int) -> String? {
+        guard passes > 0, let w = width, let h = height, w * h > maxLatentUpscaleDrawPixels else { return nil }
+        return "FLUX 3 Image Klein: metaData[\"latentUpscale\"] draws at most 1024² of area and upscales that (got "
+            + "\(w)×\(h)); ask for the draw size, the image comes back \(1 << passes)× on each side."
+    }
 
     /// nil when inside the envelope, else a user-facing reason. `width`/`height` are the requested size (nil = the
     /// first reference's prepared size, which `maxReferencePixels` keeps inside the cap, or 1024²).
@@ -90,6 +101,26 @@ public enum Flux3KleinMetaKeys {
     /// Array of objects: layout boxes on 0–1 coordinates, `{"id", "bbox": [y_min, x_min, y_max, x_max], "desc"}`, or
     /// box edits `{"id", "from": "ref_image_n" | "target", "src_bbox", "tgt_bbox" (null removes), "desc"}`.
     public static let boxes = "boxes"
+    /// Int 1 or 2 (AB-A-0257): draw at the request's size (at most 1024² of area), then double the latents once or
+    /// twice with FlowUpscaler before the decode, so the image is 2× or 4× on each side (up to 4096²), keeping the
+    /// draw's composition. Absent / 0 = no upscale.
+    public static let latentUpscale = "latentUpscale"
+
+    static func latentUpscale(_ meta: MetaData) throws -> Int {
+        let n: Int
+        switch meta[latentUpscale] {
+        case nil, .null?: return 0
+        case .int(let v)?: n = v
+        case .double(let v)? where v == v.rounded() && abs(v) <= 16: n = Int(v)
+        default: throw PackageError.unsupportedRequestFeature("metaData[\"\(latentUpscale)\"] must be 1 or 2 (×2 or ×4)")
+        }
+        guard (0 ... 2).contains(n) else {
+            throw PackageError.unsupportedRequestFeature(
+                "metaData[\"\(latentUpscale)\"] = \(n): 1 (×2) or 2 (×4) passes; a third mostly sharpens and 8192² "
+                    + "costs ~52 GB")
+        }
+        return n
+    }
 
     static func upsample(_ meta: MetaData) throws -> Bool? {
         switch meta[upsample] {
@@ -137,6 +168,19 @@ final class Flux3KleinGenerator {
     let upsamplerDirectory: URL?
     let safetyClassifier: Flux3NSFWClassifier?
     private var residentEncoder: Flux3TextEncoder?
+
+    /// Load FlowUpscaler on the first request that asks for a latent upscale (237 MB, fp32 compute).
+    func ensureLatentUpscaler(_ c: Flux3KleinConfiguration) throws {
+        guard pipeline.latentUpscaler == nil else { return }
+        guard c.latentUpscaler else {
+            throw PackageError.unsupportedRequestFeature("metaData[\"latentUpscale\"] — latentUpscaler is off")
+        }
+        guard let url = c.resolvedLatentUpscalerFile(storeRoot: c.modelsRootDirectory) else {
+            throw Flux3KleinPackageError.unreadableSnapshot(
+                c.latentUpscalerPath.isEmpty ? Flux3KleinConfiguration.latentUpscalerRepo : c.latentUpscalerPath)
+        }
+        pipeline.latentUpscaler = try FlowUpscaler.load(url: url, dtype: .float32)
+    }
 
     init(pipeline: Flux3KleinPipeline, snapshot: URL, keepEncoderResident: Bool, textEncoderQuant: Flux3TextEncoderQuant,
          upsamplerDirectory: URL?, safetyClassifier: Flux3NSFWClassifier? = nil) {
@@ -327,6 +371,11 @@ enum Flux3KleinServing {
         if let why = Flux3KleinEnvelope.violation(width: width, height: height, referenceCount: references.count) {
             throw Flux3KleinPackageError.outsideMeasuredEnvelope(why)
         }
+        let passes = try Flux3KleinMetaKeys.latentUpscale(meta)
+        if let why = Flux3KleinEnvelope.latentUpscaleViolation(width: width, height: height, passes: passes) {
+            throw Flux3KleinPackageError.outsideMeasuredEnvelope(why)
+        }
+        if passes > 0 { try generator.ensureLatentUpscaler(c) }
         let boxes = try Flux3KleinMetaKeys.boxes(meta)
         let upsample = try Flux3KleinMetaKeys.upsample(meta) ?? true
         try Task.checkCancellation()
@@ -337,6 +386,7 @@ enum Flux3KleinServing {
             prompt: caption, references: references, width: width, height: height, steps: steps ?? c.defaultSteps,
             seed: seed.map { UInt32(truncatingIfNeeded: $0) })
         req.referenceMaxPixels = Flux3KleinEnvelope.maxReferencePixels
+        req.latentUpscale = passes
         let result = try await generator.generate(req)
         try Task.checkCancellation()
         try await generator.screenOutput(result.image)
@@ -372,7 +422,9 @@ enum Flux3KleinServing {
                     name: "flux-3-klein",
                     summary: "FLUX 3 Image Klein text-to-image (Black Forest Labs, 5.55B flow-map DiT on Qwen3-VL-4B; "
                         + "16 steps, no guidance): strong English text rendering, bounding-box layout in the prompt. "
-                        + promptGuidance + " FLUX KOMMUNITY LICENCE: non-commercial, or commercial outputs only for "
+                        + promptGuidance + " metaData[\"latentUpscale\"] = 1 | 2 draws at the requested size (≤ 1024² "
+                        + "of area) and doubles the latents once or twice (FlowUpscaler) before the decode: the same "
+                        + "picture at 2× or 4× per side, up to 4096². FLUX KOMMUNITY LICENCE: non-commercial, or commercial outputs only for "
                         + "businesses under US$5M revenue that filter content and disclose AI generation; never train on "
                         + "outputs.",
                     modes: []),
@@ -382,7 +434,8 @@ enum Flux3KleinServing {
                         + "keeps its own size, fitted under 4.19 MP (2048²); several are each fitted under 1 MP. Write the "
                         + "caption as a complete description of the result, the edit folded in. Refer to the n-th "
                         + "reference as 'the n-th image', or as <ref_image_n> in box edits. " + promptGuidance
-                        + " FLUX KOMMUNITY LICENCE (see text-to-image).",
+                        + " metaData[\"latentUpscale\"] = 1 | 2 as on text-to-image (the draw, the reference's size "
+                        + "when no size is given, at most 1024²). FLUX KOMMUNITY LICENCE (see text-to-image).",
                     modes: []),
             ]
         )

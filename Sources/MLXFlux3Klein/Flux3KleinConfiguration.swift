@@ -63,6 +63,11 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
     public var safetyChecks: Bool
     /// Explicit NSFW classifier snapshot (Falconsai/nsfw_image_detection). Empty = the store.
     public var safetyClassifierPath: String
+    /// Latent upscaling (`metaData["latentUpscale"] = 1 | 2`, AB-A-0257): declares FlowUpscaler's weights
+    /// (`latentUpscalerRepo`, 118.6 MB, Unlicense) as a weight source. Off ⇒ the option is refused. Default on.
+    public var latentUpscaler: Bool
+    /// Explicit `flow_upscaler.safetensors` (or its folder). Empty = the store.
+    public var latentUpscalerPath: String
     public var modelsRootDirectory: URL?
 
     public static let repo = "mlx-community/flux-3-image-klein-bf16"
@@ -74,11 +79,15 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
     /// The NSFW classifier the reference's safety checks load (Apache-2.0, ViT-B/16, 343 MB fp32), pinned.
     public static let safetyRepo = "Falconsai/nsfw_image_detection"
     public static let safetyRevision = "96cb0d0342c7afb80cab76ecc58b265fa44da256"
+    /// FlowUpscaler (TensorForger, Unlicense) converted to bf16; the same weights flux2-klein-swift uses.
+    public static let latentUpscalerRepo = "mlx-community/FlowUpscaler-bf16"
+    public static let latentUpscalerFile = "flow_upscaler.safetensors"
 
     public init(quant: Quant = .bf16, textEncoderQuant: Flux3TextEncoderQuant = .bf16, snapshotPath: String = "",
                 defaultSteps: Int = Flux3Schedule.defaultSteps, keepEncoderResident: Bool = false,
                 upsampler: Flux3UpsamplerTier = .int8, upsamplerPath: String = "", safetyChecks: Bool = false,
-                safetyClassifierPath: String = "", modelsRootDirectory: URL? = nil) {
+                safetyClassifierPath: String = "", latentUpscaler: Bool = true, latentUpscalerPath: String = "",
+                modelsRootDirectory: URL? = nil) {
         self.quant = quant
         self.textEncoderQuant = textEncoderQuant
         self.snapshotPath = snapshotPath
@@ -88,12 +97,14 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
         self.upsamplerPath = upsamplerPath
         self.safetyChecks = safetyChecks
         self.safetyClassifierPath = safetyClassifierPath
+        self.latentUpscaler = latentUpscaler
+        self.latentUpscalerPath = latentUpscalerPath
         self.modelsRootDirectory = modelsRootDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
         case quant, textEncoderQuant, snapshotPath, defaultSteps, keepEncoderResident, upsampler, upsamplerPath
-        case safetyChecks, safetyClassifierPath
+        case safetyChecks, safetyClassifierPath, latentUpscaler, latentUpscalerPath
     }
 
     public init(from decoder: Decoder) throws {
@@ -107,6 +118,8 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
         upsamplerPath = try c.decodeIfPresent(String.self, forKey: .upsamplerPath) ?? ""
         safetyChecks = try c.decodeIfPresent(Bool.self, forKey: .safetyChecks) ?? false
         safetyClassifierPath = try c.decodeIfPresent(String.self, forKey: .safetyClassifierPath) ?? ""
+        latentUpscaler = try c.decodeIfPresent(Bool.self, forKey: .latentUpscaler) ?? true
+        latentUpscalerPath = try c.decodeIfPresent(String.self, forKey: .latentUpscalerPath) ?? ""
         modelsRootDirectory = nil
     }
 
@@ -137,7 +150,28 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
             sources.append(WeightSource(role: "safety", repo: Self.safetyRepo, revision: Self.safetyRevision,
                                         matching: ["config.json", "preprocessor_config.json", "model.safetensors"]))
         }
+        if latentUpscaler {
+            sources.append(WeightSource(role: "latent-upscaler", repo: Self.latentUpscalerRepo,
+                                        matching: [Self.latentUpscalerFile, "LICENSE", "README.md"]))
+        }
         return sources
+    }
+
+    /// FlowUpscaler's weights: the explicit path (a file or its folder), else the store's copy; nil if absent.
+    public func resolvedLatentUpscalerFile(storeRoot: URL?) -> URL? {
+        let fm = FileManager.default
+        var candidates: [URL] = []
+        if !latentUpscalerPath.isEmpty {
+            let url = URL(fileURLWithPath: latentUpscalerPath)
+            candidates += [url, url.appendingPathComponent(Self.latentUpscalerFile)]
+        }
+        if let dir = ModelStore(root: storeRoot).directory(for: Self.latentUpscalerRepo) {
+            candidates.append(dir.appendingPathComponent(Self.latentUpscalerFile))
+        }
+        return candidates.first { url in
+            var isDir: ObjCBool = false
+            return fm.fileExists(atPath: url.path, isDirectory: &isDir) && !isDir.boolValue
+        }
     }
 
     static func safetyComplete(_ dir: URL) -> Bool {
@@ -193,6 +227,7 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
                 guard let dir = resolvedSafetyDirectory(storeRoot: storeRoot) else { return true }
                 return !Self.safetyComplete(dir)
             }
+            if source.role == "latent-upscaler" { return resolvedLatentUpscalerFile(storeRoot: storeRoot) == nil }
             if !snapshotPath.isEmpty, Self.complete(URL(fileURLWithPath: snapshotPath)) { return false }
             guard let dir = resolvedSnapshotDirectory(storeRoot: storeRoot) else { return true }
             return !Self.complete(dir)
@@ -208,5 +243,26 @@ public struct Flux3KleinConfiguration: PackageConfiguration, ModelStorable, Quan
             return snap
         }
         return store.directory(for: Self.repo)
+    }
+}
+
+extension Flux3KleinConfiguration: WorkloadDeclaring {
+    /// The request's output pixels (the footprint's `ActivationScaling` axis), so the engine reserves for this image
+    /// (AB-A-0257): the draw × 4^passes. An edit without a size draws at its reference's size: inside the native
+    /// envelope that is the scalar's case (nil), and with an upscale the draw is at most 1024² (the pipeline refuses
+    /// more), so 1024² × 4^passes bounds it. A malformed option counts as none; run() refuses it.
+    public func workloadUnits(for request: any CapabilityRequest) -> Double? {
+        let width: Int?, height: Int?, meta: MetaData
+        switch request {
+        case let t2i as T2IRequest: (width, height, meta) = (t2i.width ?? 1024, t2i.height ?? 1024, t2i.metaData)
+        case let edit as IEditRequest: (width, height, meta) = (edit.width, edit.height, edit.metaData)
+        default: return nil
+        }
+        let passes = (try? Flux3KleinMetaKeys.latentUpscale(meta)) ?? 0
+        let scale = Double(1 << (2 * passes))
+        guard let width, let height else {
+            return passes > 0 ? Double(Flux3KleinEnvelope.maxLatentUpscaleDrawPixels) * scale : nil
+        }
+        return Double(width * height) * scale
     }
 }

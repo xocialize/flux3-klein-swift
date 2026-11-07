@@ -102,7 +102,8 @@ over BFL's 19 example requests. Every tier keeps 20/20 quoted strings verbatim a
   `.standard`; nil runs both untiled).
 
 **Envelope** (refused, not clamped, in `run()`):
-- output area ≤ **2048²** (4.19 MP), sides multiples of 16, at least 64 px;
+- output area ≤ **2048²** (4.19 MP), sides multiples of 16, at least 64 px; with `latentUpscale`, the draw ≤ 1024² and
+  the image ≤ 4096² (below);
 - a single reference is fitted to **2048²** (4 MiP, the reference's own cap), so an un-sized edit's output is at most that;
 - up to 10 references (each fitted under 1 MP by the model).
 
@@ -133,9 +134,45 @@ Activation above resident, bf16, v0.2.0 → v0.3.0 → v0.4.0 (GB):
 - **phys_footprint peaks:** bf16 22.8 GB (10 refs into 2048²), 20.0 GB (a 2048² reference), int4 16.0 GB. v0.3.0:
   24.5 / 17.8 GB with the 1664² cap; before that 28.2 / 21.4 GB at the 1152² cap.
 
-Tests: 18 offline (manifest licence posture, the safety switch, its weight source and refusal message, footprints and the target-Mac fit, envelope and its caps, MAT,
+Tests: 23 offline (latent upscale: the lever, the draw limit, the weight source, workload units, the footprint line; manifest licence posture, the safety switch, its weight source and refusal message, footprints and the target-Mac fit, envelope and its caps, MAT,
 CAN-1/2/3, configuration). Live: `Flux3KleinGate --package` (load, T2I, edit, envelope refusal) passes at bf16 and
 int4.
+
+## Latent upscale to 2048² and 4096² (v0.7.0, AB-A-0257)
+
+`metaData["latentUpscale"] = 1 | 2` on both surfaces: the DiT draws at the requested size (at most 1024² of area; an
+edit without a size draws at its reference's size, which must then be at most 1024²), then FlowUpscaler
+([mlx-community/FlowUpscaler-bf16](https://huggingface.co/mlx-community/FlowUpscaler-bf16), TensorForger, Unlicense;
+`FlowUpscaler` in flux2-vae-mlx-swift 0.8.0) doubles the latents once or twice before the row-band decode. The image is
+2× or 4× the draw per side, up to 4096², with the draw's composition. A padded single reference's crop scales with it.
+FLUX 3 Klein's VAE is FLUX.2's (251/251 tensors identical), so its latents are the upscaler's; the upscaler was trained
+on FLUX.2 klein-4B outputs, and FLUX 3's were checked by eye and by drift (below).
+
+- **Engine-free:** `Flux3KleinPipeline.latentUpscaler` (a loaded `FlowUpscaler`) and `Request.latentUpscale`.
+- **Seeded:** pass i draws its noise from the request's seed + i.
+- **Weights:** `Flux3KleinConfiguration.latentUpscaler` (default on) adds the `latent-upscaler` weight source (118.6 MB);
+  `latentUpscalerPath` points at a local copy. It loads on the first request that asks (237 MB, fp32 compute).
+- **Refused:** a draw over 1024² with the option (`outsideMeasuredEnvelope`), a value other than 1 or 2.
+
+**Measured** (`Flux3KleinGate --upscale`, bf16 DiT, 16 steps, captions as typed, M5 Max, MLX pool capped at 2 GB, one
+process), AB-R-0795's six prompts:
+
+| | 1024² draw | → 2048² | → 4096² |
+|---|---|---|---|
+| Wall time per request (mean of the warm five) | 17.4 s | 20.9 s | 39.5 s |
+| MLX peak over resident (11.43 GB) | 8.32 GB (the encoder) | 8.32 GB (the encoder) | 26.88 GB (the decode) |
+| Process phys_footprint peak | ≤ 20.1 GB | ≤ 20.1 GB | 39.6–40.5 GB |
+| DISTS vs the 1024² decode, downscaled (min–max, mean) | — | 0.018–0.036, 0.027 | 0.031–0.055, 0.042 |
+
+A 1-reference edit ×2: 1024² → 2048² (DISTS 0.017), and a 1000×700 reference (padded and cropped) → 2000×1400
+(0.014). By eye at 2048² and 4096²: the same picture with finer skin, hair, brick and roof detail; letters intact; no
+tiling, ringing or colour shift.
+
+**Footprint.** Each tier's footprint carries an `ActivationScaling` on output pixels through (1024², 8.2 GB) and (4096²,
+30.0 GB): above every native point of the envelope and the 4096² decode (28.77 GB over the declared bf16 resident,
++4 %). `Flux3KleinConfiguration` is `WorkloadDeclaring` (the draw × 4^passes), so the engine reserves per run and
+refuses past 4096². The native envelope keeps its 12.0 GB reserve up to 1920²; native 2048² reserves 12.56 GB, and int4
+still fits a 24 GB Mac.
 
 ## Safety checks (P6, off by default)
 

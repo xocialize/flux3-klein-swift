@@ -46,10 +46,28 @@ enum Flux3KleinFootprints {
     /// Area a single reference is fitted to: the reference's own 4 MiP, now that its VAE encode runs in row bands.
     static let envelopeReferenceMaxPixels = 2048 * 2048
 
+    /// Output area with a latent upscale (AB-A-0257): a 1024² draw ×4 = 4096².
+    static let envelopeUpscaledMaxPixels = 4096 * 4096
+
+    /// Activation over output pixels (AB-A-0257). MEASURED with `Flux3KleinGate --upscale` (bf16, 16 steps, MLX pool
+    /// capped at 2 GB, M5 Max, AB-R-0795's six prompts in one process): a latent-upscaled 2048² run peaks at the
+    /// encoder transient (8.32 GB over resident), a 4096² run at its fp32 row-band decode, 26.88 GB over MLX resident;
+    /// phys_footprint 39.56 → 40.47 GB over the six (28.77 GB over the declared bf16 resident). The line runs through
+    /// (1024², 8.2 GB) and (4096², 30.0 GB, +4 %): above every native point of the envelope (10 references at 1024²,
+    /// 8.11 GB; 2048², 10.32 GB) and the 4096² upscale. The reserve per run is max(scalar, line), so the native envelope
+    /// keeps its 12.0 GB up to 1920² and native 2048² reserves 12.56 GB (int4 total 17.5 GB, still inside a 24 GB
+    /// Mac's 19.07 GB budget).
+    static let activationScaling = ActivationScaling(
+        axis: .outputPixels, baseBytes: 6_746_700_000, bytesPerUnit: 1386.0,
+        measuredCeiling: Double(envelopeUpscaledMaxPixels))
+
     static let declared: [QuantFootprint] = [
-        QuantFootprint(quant: .bf16, residentBytes: 11_700_000_000, peakActivationBytes: 12_000_000_000),
-        QuantFootprint(quant: .int8, residentBytes: 6_700_000_000, peakActivationBytes: 12_000_000_000),
-        QuantFootprint(quant: .int4, residentBytes: 4_900_000_000, peakActivationBytes: 12_000_000_000),
+        QuantFootprint(quant: .bf16, residentBytes: 11_700_000_000, peakActivationBytes: 12_000_000_000,
+                       activationScaling: activationScaling),
+        QuantFootprint(quant: .int8, residentBytes: 6_700_000_000, peakActivationBytes: 12_000_000_000,
+                       activationScaling: activationScaling),
+        QuantFootprint(quant: .int4, residentBytes: 4_900_000_000, peakActivationBytes: 12_000_000_000,
+                       activationScaling: activationScaling),
     ]
 
     /// The text-only conditioner's weights, added to the resident term when it is kept resident.
